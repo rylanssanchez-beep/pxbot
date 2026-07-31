@@ -1,0 +1,5 @@
+# Runtime market-data caches and session state — regenerated on server start, not source
+tick_bars.json
+tv_context.json
+tl_session.json
+node_modules/

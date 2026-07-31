@@ -1,0 +1,498 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PXBOT NQ Console</title>
+  <link rel="stylesheet" href="style.css?v=20260727a">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <div class="mark">PX</div>
+    <div>
+      <h1>PXBOT &mdash; NQ Operator Console</h1>
+      <p>Asia &rarr; London &rarr; NYAM &middot; 4-Scenario ICT Framework</p>
+    </div>
+  </div>
+  <div class="status-row">
+    <span id="clock">--:--:-- ET</span>
+    <span id="sessionPill" class="pill yellow-pill">--</span>
+    <span id="windowCountdown" class="window-countdown">Next window: --</span>
+    <span id="tlPill" class="pill red-pill">TradeLocker: OFF</span>
+    <span id="aiPill" class="pill muted-pill">Ollama: OFF</span>
+  </div>
+  <div class="live-ticker" id="liveTicker">
+    <div class="ticker-block">
+      <span class="ticker-label">NAS100</span>
+      <span id="livePrice" class="live-price price-flat">--</span>
+      <span id="liveChange" class="muted ticker-change">--</span>
+    </div>
+    <div class="ticker-stats">
+      <span class="muted">Bid</span><strong id="liveBid">--</strong>
+      <span class="muted">Ask</span><strong id="liveAsk">--</strong>
+      <span class="muted">H</span><strong id="liveDayHigh" class="green">--</strong>
+      <span class="muted">L</span><strong id="liveDayLow" class="red">--</strong>
+    </div>
+  </div>
+</header>
+
+<!-- EXIT SIGNAL ALERT — fires when trade exit conditions are met -->
+<div id="exitAlert" class="exit-alert" style="display:none">
+  <div class="ea-inner">
+    <span class="ea-icon" id="exitAlertIcon">⚠</span>
+    <div>
+      <strong id="exitAlertTitle">EXIT SIGNAL</strong>
+      <span id="exitAlertDesc">Condition met</span>
+    </div>
+    <div class="ea-pnl">
+      <span>Est. P&amp;L</span>
+      <strong id="exitAlertPnl">--</strong>
+    </div>
+    <button id="exitAlertAck" class="ea-ack">Acknowledged</button>
+  </div>
+</div>
+
+<!-- ENTRY WINDOW ALERT — shown only when pre-market or NY open is live -->
+<div id="windowAlert" class="window-alert" style="display:none">
+  <div class="wa-inner">
+    <span class="wa-dot"></span>
+    <strong id="waTitle">PRE-MARKET ENTRY WINDOW OPEN</strong>
+    <span id="waDesc">7:00 – 9:30 AM ET &nbsp;·&nbsp; Watch for price to hit the OTE fib zone</span>
+    <span id="waTimer" class="wa-timer">closes in --:--</span>
+  </div>
+</div>
+
+<main class="layout">
+
+  <!-- LEFT RAIL -->
+  <aside class="rail">
+
+    <section class="panel">
+      <h2>Session Ranges <span class="muted" id="todayDate"></span></h2>
+      <div class="session-rows">
+        <div class="sess-row" id="asiaRow">
+          <div class="sess-label asia-dot">ASIA</div>
+          <div class="sess-vals">
+            <span>H <strong id="asiaHigh">--</strong></span>
+            <span>L <strong id="asiaLow">--</strong></span>
+            <span class="muted" id="asiaRange">-- pts</span>
+          </div>
+        </div>
+        <div class="sess-row" id="londonRow">
+          <div class="sess-label london-dot">LONDON</div>
+          <div class="sess-vals">
+            <span>H <strong id="londonHigh">--</strong></span>
+            <span>L <strong id="londonLow">--</strong></span>
+            <span class="muted" id="londonRange">-- pts</span>
+          </div>
+        </div>
+        <div class="sess-row" id="nyamRow">
+          <div class="sess-label nyam-dot">NY OPEN</div>
+          <div class="sess-vals">
+            <span>H <strong id="nyamHigh">--</strong></span>
+            <span>L <strong id="nyamLow">--</strong></span>
+            <span class="muted" id="nyamRange">-- pts</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel scenario-panel" id="scenarioPanel">
+      <h2>Detected Scenario</h2>
+      <div id="scenarioCard" class="scenario-card wait-card">
+        <div class="scenario-icon" id="scenarioIcon">?</div>
+        <div class="scenario-body">
+          <b id="scenarioName">Scanning&hellip;</b>
+          <p id="scenarioDesc">Waiting for Asia and London data to build.</p>
+        </div>
+      </div>
+      <div class="scenario-legend">
+        <div class="leg-row"><span class="leg-num buy">1</span> NY Continuation — Asia trends, London consolidates</div>
+        <div class="leg-row"><span class="leg-num buy">2</span> NY Consolidation — London swept Asia, NY continues</div>
+        <div class="leg-row"><span class="leg-num sell">3</span> NY Reversal — London moved WITHOUT sweeping Asia</div>
+        <div class="leg-row"><span class="leg-num warn">4</span> Search &amp; Destroy — London sweeps both sides, AVOID</div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Fibonacci Entry Levels</h2>
+      <div class="fib-basis">
+        Swing: <span id="fibHigh" class="green">H --</span> &rarr; <span id="fibLow" class="red">L --</span>
+      </div>
+      <div id="fibTable" class="fib-table">
+        <div class="fib-row header"><span>Level</span><span>Price</span><span>Zone</span></div>
+      </div>
+      <div class="fib-note">Entry zone: <strong class="blue">0.618 – 0.705 OTE</strong></div>
+    </section>
+
+    <!-- DAILY TRADE LIMIT -->
+    <section class="panel limit-panel">
+      <div class="limit-header">
+        <h2>Daily Trade Limit</h2>
+        <span id="tradeCountPill" class="pill green-pill">0 / 4</span>
+      </div>
+      <div class="trade-slots" id="tradeSlots">
+        <div class="slot empty" id="slot1"></div>
+        <div class="slot empty" id="slot2"></div>
+        <div class="slot empty" id="slot3"></div>
+        <div class="slot empty" id="slot4"></div>
+      </div>
+      <div id="activeTradeBanner" class="active-trade-banner" style="display:none">
+        <span class="pulse-dot"></span>
+        TRADE ACTIVE &mdash; signals locked
+      </div>
+      <div id="limitReachedBanner" class="limit-banner" style="display:none">
+        &#128683; DAILY LIMIT HIT &mdash; done for today
+      </div>
+      <button id="resetDayBtn" class="danger" style="margin-top:8px;width:100%">Reset Day (New Session)</button>
+      <label class="override-row" title="Bypass daily trade limit and setup locks — use with discipline">
+        <input type="checkbox" id="overrideDailyLimit">
+        <span>Override Session Limits</span>
+        <span class="muted" style="font-size:10px;margin-left:auto">trade as many as I want</span>
+      </label>
+    </section>
+
+    <!-- SIGNAL QUALITY GATES -->
+    <section class="panel gates-panel">
+      <h2>A+ Signal Requirements</h2>
+      <div class="gate-row">
+        <span>Min Confidence</span>
+        <div class="gate-ctrl">
+          <input id="minConf" type="number" value="75" min="50" max="99" style="width:52px;padding:5px 7px">
+          <span class="muted">%</span>
+        </div>
+      </div>
+      <div class="gate-row">
+        <span>Min R:R</span>
+        <div class="gate-ctrl">
+          <input id="minRR" type="number" value="2.5" min="1" max="10" step="0.5" style="width:52px;padding:5px 7px">
+          <span class="muted">R</span>
+        </div>
+      </div>
+      <div class="gate-row">
+        <span>Min Target</span>
+        <div class="gate-ctrl">
+          <input id="minTarget" type="number" value="60" min="20" max="500" step="5" style="width:52px;padding:5px 7px">
+          <span class="muted">pts</span>
+        </div>
+      </div>
+      <div id="gateStatus" class="gate-status green">All gates ready</div>
+    </section>
+
+    <section class="panel">
+      <h2>Risk Calculator (NQ)</h2>
+      <label>Account size
+        <input id="accountSize" type="number" value="25000" min="100">
+      </label>
+      <label>Risk per trade %
+        <input id="riskPct" type="number" value="1" min="0.1" max="5" step="0.1">
+      </label>
+      <label>Stop (points)
+        <input id="stopPts" type="number" value="20" min="1" step="0.25">
+      </label>
+      <div class="risk-grid">
+        <div class="risk-box"><span>$ at risk</span><strong id="riskDollars">--</strong></div>
+        <div class="risk-box"><strong id="contracts">-- contracts</strong><span>to stay inside risk</span></div>
+      </div>
+      <div class="risk-box" style="margin-top:8px">
+        <span>Stop value per contract</span>
+        <strong id="stopValue">--</strong>
+      </div>
+    </section>
+
+  </aside>
+
+  <!-- CENTER CHART -->
+  <section class="center">
+    <div class="chart-head">
+      <div>
+        <h2 id="chartTitle">NQ Futures &mdash; Live Simulation</h2>
+        <p id="chartDesc" class="muted">Session zones: purple=Asia &middot; blue=London &middot; gold=Pre-market &middot; green=NYAM &middot; Fib OTE in teal</p>
+      </div>
+      <div class="toolbar">
+        <button data-tf="1">1m</button>
+        <button data-tf="5" class="active">5m</button>
+        <button data-tf="15">15m</button>
+        <button data-tf="30">30m</button>
+        <button data-tf="60">1H</button>
+        <button data-tf="240">4H</button>
+        <button data-tf="1440">D</button>
+        <span id="liveTag" class="pill muted-pill" style="font-size:10px">SIM</span>
+        <button id="tradingModeBtn" class="trading-mode-btn off" onclick="toggleTradingMode()" title="Toggle bot scanning on/off">&#9673; BOT: OFF</button>
+        <span id="botScanPulse" class="bot-scan-pulse" style="display:none" title="Bot is actively scanning for trades">&#9679; SCANNING</span>
+        <button id="runAiSignal" class="ai-signal-btn">&#129504; Run AI Signal</button>
+        <button id="scanNow" class="accent-btn">&#8635; Sim Re-Scan</button>
+        <button id="replayToggle" class="replay-btn">&#9654; Bar Replay</button>
+      </div>
+    </div>
+    <div class="chart-shell">
+      <!-- TV widget lives here during normal use -->
+      <div id="chart"></div>
+      <!-- LWC replay chart — shown only during Bar Replay, hidden otherwise -->
+      <div id="chartReplay" style="display:none;width:100%;height:100%"></div>
+      <div id="chartSub" class="chart-sub-bar"></div>
+    </div>
+    <!-- BAR REPLAY — TradingView-grade controls -->
+    <div id="replayBar" class="replay-bar" style="display:none">
+      <!-- Row 1: Progress scrubber -->
+      <div class="rp-scrubber-row">
+        <span id="rpSession" class="rp-sess-tag">--</span>
+        <span id="rpDateTime" class="rp-datetime">--</span>
+        <input id="rpProgress" type="range" min="1" max="500" value="1" class="rp-scrubber" title="Scrub to any bar">
+        <span id="rpBarCount" class="rp-barcount">-- / --</span>
+        <span id="rpProgressPct" class="muted" style="font-size:10px;min-width:38px">0%</span>
+      </div>
+      <!-- Row 2: OHLCV readout -->
+      <div id="rpOHLC" class="rp-ohlc-row">O -- H -- L -- C -- V --</div>
+      <!-- Row 3: Playback controls -->
+      <div class="replay-controls">
+        <button id="replayPlay" title="Space to toggle">&#9654; Play</button>
+        <button id="replayStepBack" title="← Arrow">&#10094; Back</button>
+        <button id="replayStepFwd"  title="→ Arrow">&#10095; Fwd</button>
+        <button id="replayStepBack10" title="↓ Arrow">⏮ ×10</button>
+        <button id="replayStepFwd10" title="↑ Arrow">⏭ ×10</button>
+        <label class="rp-speed-label">
+          Speed
+          <input id="replaySpeed" type="range" min="1" max="20" value="3" style="width:72px">
+          <span id="replaySpeedVal">3</span>x
+        </label>
+        <button id="replayStop" class="danger" title="Exit replay">&#9632; Exit</button>
+      </div>
+      <!-- Row 4: Trade entry -->
+      <div class="replay-trade-box">
+        <button id="rpLong"  class="rp-long">▲ LONG</button>
+        <button id="rpShort" class="rp-short">▼ SHORT</button>
+        <label class="rp-inp-label">SL pts <input id="rpStop"   type="number" value="20" min="1" style="width:52px"></label>
+        <label class="rp-inp-label">TP pts  <input id="rpTarget" type="number" value="40" min="1" style="width:52px"></label>
+        <span id="rpTradeLabel" class="green" style="display:none;font-size:12px;font-weight:600"></span>
+        <span class="rp-pnl">Live P&amp;L: <strong id="rpLivePnl" class="muted">--</strong></span>
+        <span class="rp-pnl">Session: <strong id="rpPnl" class="green">$0</strong></span>
+        <button id="rpCloseTrade" style="display:none" class="danger">Close Trade</button>
+      </div>
+      <!-- Keyboard hint -->
+      <div class="rp-kbd-hint">⌨ Space=play/pause &nbsp;·&nbsp; ←→ = step bar &nbsp;·&nbsp; ↑↓ = step ×10 &nbsp;·&nbsp; scrub slider = jump to any bar</div>
+    </div>
+
+    <div class="decision-strip">
+      <div>
+        <span>Scenario</span>
+        <strong id="stripScenario">--</strong>
+      </div>
+      <div>
+        <span>Bias</span>
+        <strong id="stripBias">WAIT</strong>
+      </div>
+      <div>
+        <span>OTE Entry Zone</span>
+        <strong id="stripEntry">--</strong>
+      </div>
+      <div>
+        <span>Stop</span>
+        <strong id="stripStop">--</strong>
+      </div>
+      <div>
+        <span>Target</span>
+        <strong id="stripTarget">--</strong>
+      </div>
+      <div>
+        <span>R:R</span>
+        <strong id="stripRR">--</strong>
+      </div>
+    </div>
+  </section>
+
+  <!-- RIGHT PANEL -->
+  <aside class="side">
+    <section class="panel hot">
+      <div class="panel-head">
+        <h2>NYAM Signal</h2>
+        <div style="display:flex;gap:6px">
+          <button id="logSignal" class="accent-btn">&#9654; Take Trade</button>
+          <button id="closeWin"  class="win-btn"  style="display:none">&#10003; Win</button>
+          <button id="closeLoss" class="loss-btn" style="display:none">&#10005; Loss</button>
+        </div>
+      </div>
+      <div id="signalCard" class="signal-card wait">
+        <div class="sig-bias" id="sigBiasLabel">WAIT</div>
+        <h3 id="sigTitle">Waiting for Setup</h3>
+        <div class="sig-levels" id="sigLevels"></div>
+        <p id="sigReason" class="muted">Scanning Asia and London for scenario...</p>
+      </div>
+    </section>
+
+    <!-- TRADE MANAGER — visible only when a trade is active -->
+    <section class="panel trade-mgr-panel" id="tradeMgrPanel" style="display:none">
+      <div class="panel-head">
+        <h2>&#128200; Trade Manager</h2>
+        <span id="tmStatus" class="pill blue-pill">RUNNING</span>
+      </div>
+      <div class="tm-grid">
+        <div class="tm-box"><span>Entry</span><strong id="tmEntry">--</strong></div>
+        <div class="tm-box"><span>Current</span><strong id="tmCurrent">--</strong></div>
+        <div class="tm-box"><span>Stop</span><strong id="tmStop" class="red">--</strong></div>
+        <div class="tm-box"><span>Target</span><strong id="tmTarget" class="green">--</strong></div>
+      </div>
+      <div class="tm-pnl-row">
+        <div class="tm-pnl-box">
+          <span>Est. P&amp;L</span>
+          <strong id="tmPnl" class="green">$0</strong>
+        </div>
+        <div class="tm-pnl-box">
+          <span>To target</span>
+          <strong id="tmToTarget">--</strong>
+        </div>
+        <div class="tm-pnl-box">
+          <span>To stop</span>
+          <strong id="tmToStop" class="red">--</strong>
+        </div>
+      </div>
+      <div class="tm-progress-wrap">
+        <div class="tm-progress-bar">
+          <div id="tmProgressFill" class="tm-progress-fill"></div>
+        </div>
+        <div class="tm-progress-labels">
+          <span class="red">STOP</span>
+          <span id="tmProgressPct" class="muted">0%</span>
+          <span class="green">TARGET</span>
+        </div>
+      </div>
+      <div id="holdTimeCountdown" class="tm-hold-countdown" style="display:none"></div>
+      <div id="tmExitNote" class="tm-exit-note" style="display:none"></div>
+      <div class="tm-kill-row">
+        <span class="muted">Kill zone closes</span>
+        <strong id="tmKillClose" class="yellow">10:30 AM ET</strong>
+        <span id="tmKillCountdown" class="muted"></span>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Trade Journal</h2>
+        <button id="exportCsv">CSV</button>
+      </div>
+      <div id="journal" class="journal"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Pre-Market Watch</h2>
+      <p class="muted" style="font-size:12px;margin-bottom:8px">
+        Scenarios 3 &amp; 4 can trigger <em>before</em> NY open if London already reversed.
+        Check fib pull-back on the chart during 7:30–8:30 CT.
+      </p>
+      <div id="premarketCard" class="scan-card">
+        <b id="premarketBias" class="yellow">Analyzing&hellip;</b>
+        <p id="premarketNote">Pre-market signal will appear here once London session completes.</p>
+      </div>
+    </section>
+  </aside>
+
+</main>
+
+<!-- BOTTOM ROW -->
+<div class="lower">
+
+  <!-- TRADELOCKER -->
+  <div class="panel tl-panel">
+    <div class="panel-head">
+      <h2>&#128279; TradeLocker Account</h2>
+      <span id="tlStatusLabel" class="pill red-pill">Disconnected</span>
+    </div>
+    <div id="tlConnect" class="tl-connect">
+      <label>API Base URL <span class="muted">(usually shared — try live first)</span>
+        <select id="tlBaseUrl">
+          <option value="https://live.tradelocker.com">https://live.tradelocker.com</option>
+          <option value="https://demo.tradelocker.com">https://demo.tradelocker.com</option>
+        </select>
+      </label>
+      <label>Broker Server Name <span class="muted">(e.g. GenFX — shown in TradeLocker login screen)</span>
+        <input id="tlServerName" placeholder="GenFX" value="GenFX">
+      </label>
+      <label>Email
+        <input id="tlEmail" type="email" placeholder="your@email.com" value="rylan.s.sanchez@gmail.com">
+      </label>
+      <label>Password
+        <input id="tlPass" type="password" placeholder="••••••••" value="x54nG^EL">
+      </label>
+      <button id="tlLoginBtn" class="accent-btn" onclick="tlLogin()">Connect to TradeLocker</button>
+      <div id="tlError" style="display:none;margin-top:10px;padding:10px 12px;background:#3a1c1c;border:1px solid #ff5368;border-radius:8px;color:#ff8a96;font-size:13px;line-height:1.5;white-space:pre-wrap"></div>
+      <p class="tl-note muted">Your credentials are only stored in browser memory and never sent anywhere except your TradeLocker server. If GENFX-LIVE doesn't work, check the exact server name shown when you log into the TradeLocker app — it's usually visible on the login screen's server dropdown.</p>
+    </div>
+    <div id="tlDash" class="tl-dash" style="display:none">
+      <div class="tl-acct-row">
+        <div class="risk-box"><span>Account</span><strong id="tlAcctName">--</strong></div>
+        <div class="risk-box"><span>Balance</span><strong id="tlBalance">--</strong></div>
+        <div class="risk-box"><span>Equity</span><strong id="tlEquity">--</strong></div>
+        <button id="tlRefresh" style="margin-left:auto">Refresh</button>
+        <button id="tlDisconnect" class="danger">Disconnect</button>
+      </div>
+      <div class="panel-head" style="margin-top:10px">
+        <h2>Open Positions</h2>
+        <button id="tlClosePosBtn" style="display:none">Close Selected</button>
+      </div>
+      <div id="tlPositions" class="tl-positions">No open positions.</div>
+    </div>
+  </div>
+
+  <!-- AI SIGNAL ENGINE -->
+  <div class="panel ai-panel">
+    <div class="panel-head">
+      <h2>&#129504; Ollama — AI Signal Engine</h2>
+      <div class="toolbar">
+        <select id="ollamaModel" style="background:#1f2430;color:#eef3fb;border:1px solid #2d3442;border-radius:6px;padding:6px 8px;font:inherit">
+          <option value="llama3">llama3</option>
+          <option value="llama3:70b">llama3:70b</option>
+          <option value="mistral">mistral</option>
+          <option value="phi3">phi3</option>
+          <option value="gemma">gemma</option>
+          <option value="deepseek-r1">deepseek-r1</option>
+        </select>
+        <span id="aiDataSource" class="pill muted-pill" style="font-size:10px">SIM DATA</span>
+      </div>
+    </div>
+    <div id="aiThinking" class="ai-thinking" style="display:none">
+      <div class="ai-thinking-dots"><span></span><span></span><span></span></div>
+      <span id="aiThinkingLabel">Fetching NQ data…</span>
+    </div>
+    <div id="aiOutput" class="ai-output">
+      <span class="muted">AI is the signal engine. Click <strong style="color:var(--cyan)">Run AI Signal</strong> (top of chart) and Ollama will:<br><br>
+      1. Receive the full NQ candle dataset<br>
+      2. Identify today's scenario itself (no hardcoded rules)<br>
+      3. Calculate its own entry, stop, and target<br>
+      4. Update every panel on this screen<br><br>
+      Requires Ollama running locally: <code>ollama serve</code></span>
+    </div>
+    <div id="aiConfidence" class="ai-confidence" style="display:none">
+      <span class="muted">AI Confidence</span>
+      <div class="conf-bar"><div id="confFill" class="conf-fill"></div></div>
+      <strong id="confPct">--</strong>
+    </div>
+  </div>
+
+  <!-- WEEKLY STRATEGY -->
+  <div class="panel weekly-panel">
+    <div class="panel-head">
+      <h2>&#128197; Weekly Strategy</h2>
+      <button id="runWeekly" class="accent-btn">Run Sunday Refresh</button>
+    </div>
+    <div id="weeklyStats" class="weekly-stats">
+      <div class="scan-card">
+        <b id="backtestTitle" class="yellow">No backtest run yet</b>
+        <p id="backtestBody" class="muted">Click "Run Sunday Refresh" to backtest the 4 scenarios over the last 30 sim-days and find the A+ setup for this week.</p>
+      </div>
+    </div>
+    <div class="scenario-win-grid" id="scenarioWinGrid"></div>
+  </div>
+
+</div>
+
+<footer>
+  PXBOT NQ Console &mdash; Decision support only. Not financial advice. Always confirm your entry manually before executing. Keep real-money execution manual until you have 30+ consistent paper wins.
+</footer>
+
+<script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
+<script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+<script src="app.js?v=20260728b"></script>
+</body>
+</html>
