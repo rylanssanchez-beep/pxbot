@@ -2,12 +2,13 @@
 
 // PXBOT Operator Console — Node.js server + TradeLocker proxy
 // Runs on http://127.0.0.1:8899
-// No dependencies — uses only Node built-ins
+// Core proxy uses only Node built-ins; /mcp needs @modelcontextprotocol/sdk + zod (see package.json)
 
 const http         = require('http');
 const https        = require('https');
 const fs           = require('fs');
 const path         = require('path');
+const crypto       = require('crypto');
 const { execFile } = require('child_process');
 
 const ROOT = __dirname;
@@ -1205,6 +1206,121 @@ async function handleTVContext(req, res) {
   }
 }
 
+// ── MCP endpoint — read-only Claude custom connector ───────────────────────────
+// Exposes the exact same literal data the browser UI shows (candles, quote,
+// session/market context, deep swing structure, positions) as MCP tools, so an
+// Artifact chart (or Claude directly, in chat) can read the live TradeLocker
+// feed. Read-only by design — there is no trade/order tool. Everything you
+// execute stays manual.
+let McpServer, StreamableHTTPServerTransport, z;
+try {
+  ({ McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js'));
+  ({ StreamableHTTPServerTransport } = require('@modelcontextprotocol/sdk/server/streamableHttp.js'));
+  ({ z } = require('zod'));
+} catch (e) {
+  console.warn('  [MCP] @modelcontextprotocol/sdk / zod not installed yet — run `npm install` in this folder to enable /mcp');
+}
+
+const MCP_TOKEN_FILE = path.join(ROOT, 'mcp_token.json');
+function getMcpToken() {
+  if (process.env.PXBOT_MCP_TOKEN) return process.env.PXBOT_MCP_TOKEN;
+  try { return JSON.parse(fs.readFileSync(MCP_TOKEN_FILE, 'utf8')).token; } catch (_) {}
+  const token = crypto.randomBytes(24).toString('hex');
+  try { fs.writeFileSync(MCP_TOKEN_FILE, JSON.stringify({ token })); } catch (_) {}
+  return token;
+}
+const MCP_TOKEN = getMcpToken();
+
+// Same-process loopback so every MCP tool returns literally what /api/* returns —
+// one source of truth, no duplicated candle/quote logic to drift out of sync.
+function loopbackGet(apiPath) {
+  return new Promise((resolve, reject) => {
+    http.get({ hostname: '127.0.0.1', port: PORT, path: apiPath }, r => {
+      let d = '';
+      r.on('data', c => d += c);
+      r.on('end', () => { try { resolve(JSON.parse(d)); } catch (e) { reject(e); } });
+    }).on('error', reject);
+  });
+}
+
+function jsonToolResult(data) {
+  return { content: [{ type: 'text', text: JSON.stringify(data) }] };
+}
+
+function buildMcpServer() {
+  const server = new McpServer({ name: 'pxbot-tradelocker', version: '1.0.0' });
+
+  server.registerTool('get_candles', {
+    title: 'Get literal TradeLocker candles',
+    description: 'Literal OHLCV candles for the connected NAS100/NQ instrument, exactly as the PXBOT chart shows them — sourced from TradeLocker directly. Falls back to calibrated NDX+tick data only when TradeLocker history is temporarily unavailable; check the "source" field ("tradelocker" = live TL history).',
+    inputSchema: {
+      resolution: z.enum(['1', '5', '15', '30', '60', '240', '1440']).default('5').describe('Bar size in minutes (1440 = daily)'),
+      count: z.number().int().min(1).max(2000).default(300).describe('Number of most recent bars to return'),
+    },
+  }, async ({ resolution, count }) => jsonToolResult(await loopbackGet(`/api/candles?resolution=${resolution}&count=${count}`)));
+
+  server.registerTool('get_quote', {
+    title: 'Get live TradeLocker quote',
+    description: 'Current live bid/ask/last price, change, and day range for the connected NAS100/NQ instrument.',
+    inputSchema: {},
+  }, async () => jsonToolResult(await loopbackGet('/api/quote')));
+
+  server.registerTool('get_market_context', {
+    title: 'Get session/day/week context',
+    description: 'Current trading session (Asia/London/NY open/lunch/etc.), day-of-week and monthly/quarterly seasonal tendencies, and adaptive ATR/range stats built from accumulated live tick bars.',
+    inputSchema: {},
+  }, async () => jsonToolResult(await loopbackGet('/api/context')));
+
+  server.registerTool('get_deep_context', {
+    title: 'Get deep swing/liquidity structure',
+    description: 'Multi-month structure: recent 5m/1H bars, daily bars, weekly profile, swing highs/lows (external liquidity) and equal-high/equal-low pools, plus ATR(14) on daily bars. Prices are NDX-scale — see the note field for the NQ offset.',
+    inputSchema: {},
+  }, async () => jsonToolResult(await loopbackGet('/api/tvcontext')));
+
+  server.registerTool('get_positions', {
+    title: 'Get open positions (read-only)',
+    description: 'Currently open positions on the connected TradeLocker account. Read-only — this tool never places, modifies, or closes trades. All execution stays manual.',
+    inputSchema: {},
+  }, async () => jsonToolResult(await loopbackGet('/api/positions')));
+
+  server.registerTool('get_health', {
+    title: 'Get connection health',
+    description: 'Whether the server is currently authenticated to TradeLocker, and which account/instrument it resolved.',
+    inputSchema: {},
+  }, async () => jsonToolResult(await loopbackGet('/api/health')));
+
+  return server;
+}
+
+function checkMcpAuth(req) {
+  const u = new URL(req.url, `http://127.0.0.1:${PORT}`);
+  const qToken = u.searchParams.get('token');
+  const authHeader = req.headers['authorization'] || '';
+  const bearer = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  return Boolean(MCP_TOKEN) && (qToken === MCP_TOKEN || bearer === MCP_TOKEN);
+}
+
+async function handleMcp(req, res) {
+  cors(res);
+  if (!McpServer) return send(res, 501, { error: 'MCP SDK not installed. Run `npm install` in the PXBOT folder, then restart the server.' });
+  if (!checkMcpAuth(req)) return send(res, 401, { error: 'Missing or invalid token. Append ?token=YOUR_TOKEN to the URL or send it as an Authorization: Bearer header — see mcp_token.json.' });
+  if (req.method === 'GET' || req.method === 'DELETE') {
+    res.writeHead(405, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32000, message: 'Method not allowed.' }, id: null }));
+  }
+  const body = await readBody(req);
+  try {
+    const mcpServer = buildMcpServer();
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+    await mcpServer.connect(transport);
+    await transport.handleRequest(req, res, body);
+    res.on('close', () => { transport.close(); mcpServer.close(); });
+  } catch (e) {
+    console.error('  [MCP] Error:', e.message);
+    if (!res.headersSent) send(res, 500, { jsonrpc: '2.0', error: { code: -32603, message: 'Internal server error' }, id: null });
+  }
+}
+
 // ── Router ────────────────────────────────────────────────────────────────────
 http.createServer((req, res) => {
   if (req.method === 'OPTIONS') { cors(res); res.writeHead(204); return res.end(); }
@@ -1221,6 +1337,8 @@ http.createServer((req, res) => {
   if (p === '/api/stream'    && req.method === 'GET')  return handleStream(req, res);
   if (p === '/api/context'   && req.method === 'GET')  return handleContext(req, res);
   if (p === '/api/tvcontext' && req.method === 'GET')  return handleTVContext(req, res);
+  if (p === '/mcp'           && req.method === 'POST') return handleMcp(req, res);
+  if (p === '/mcp')                                    return handleMcp(req, res); // returns 405 for GET/DELETE
   return handleStatic(req, res);
 
 }).listen(PORT, '127.0.0.1', () => {
@@ -1229,6 +1347,10 @@ http.createServer((req, res) => {
   console.log('  PXBOT NQ Console  +  TradeLocker Proxy');
   console.log(`  http://127.0.0.1:${PORT}`);
   console.log('  Keep this window open while you trade');
+  console.log('  ------------------------------------------------------');
+  console.log('  Claude MCP connector endpoint (for the tunnel):');
+  console.log(`    POST http://127.0.0.1:${PORT}/mcp?token=${MCP_TOKEN}`);
+  console.log('  See MCP_CONNECTOR_SETUP.md to expose this to claude.ai');
   console.log('  ====================================================');
   console.log('');
   // Auto-connect from last saved session + refresh NDX chart data on every boot

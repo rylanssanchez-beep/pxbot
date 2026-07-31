@@ -1,0 +1,14 @@
+{
+  "name": "pxbot-nq-console",
+  "version": "1.0.0",
+  "private": true,
+  "description": "PXBOT NQ Console — TradeLocker proxy, chart UI, and a Claude MCP connector endpoint",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^3.25.0"
+  }
+}

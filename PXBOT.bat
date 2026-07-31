@@ -11,6 +11,12 @@ for /f "tokens=5" %%a in ('netstat -ano 2^>nul ^| findstr ":8899 "') do (
   taskkill /PID %%a /F >nul 2>&1
 )
 
+:: Install dependencies on first run (needed for the /mcp connector endpoint)
+if not exist "%~dp0node_modules" (
+  echo  Installing dependencies (first run only)...
+  call npm install --prefix "%~dp0"
+)
+
 :: Start the server
 start "PXBOT Server" /min node "%~dp0server.js"
 
@@ -23,6 +29,8 @@ start "" "http://localhost:8899"
 
 echo  Server running at http://localhost:8899
 echo  Close this window to STOP the server.
+echo.
+echo  To let Claude read this chart live in chat, see MCP_CONNECTOR_SETUP.md
 echo.
 pause
 taskkill /FI "WINDOWTITLE eq PXBOT Server" /F >nul 2>&1
