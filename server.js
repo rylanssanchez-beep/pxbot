@@ -353,12 +353,24 @@ async function handleAccounts(req, res) {
   send(res, r.status === 200 ? 200 : r.status, r.json);
 }
 
-// Parse TradeLocker column-format OHLCV response → bar array
-// TL returns: {s:"ok", d:{t:[...], o:[...], h:[...], l:[...], c:[...], v:[...]}}
+// Parse TradeLocker /trade/history response → bar array
+// Per the documented API (public-api.tradelocker.com/reference/gethistory), the
+// real shape is {s:"ok", d:{barDetails:[{t,o,h,l,c,v}, ...]}} with t in unix MS.
 function parseTLBars(json) {
   const d = json?.d;
   if (!d) return [];
-  // Column format (standard TL history response)
+  // Documented format: array of bar objects under d.barDetails
+  if (Array.isArray(d.barDetails) && d.barDetails.length > 0) {
+    return d.barDetails.map(b => ({
+      time:   Math.floor(parseInt(b.t || 0) / 1000), // ms -> seconds, matches the rest of this app
+      open:   parseFloat(b.o || 0),
+      high:   parseFloat(b.h || 0),
+      low:    parseFloat(b.l || 0),
+      close:  parseFloat(b.c || 0),
+      volume: parseInt(b.v || 0),
+    })).filter(b => b.close > 0 && b.time > 0);
+  }
+  // Column format (seen on some older/other TL deployments)
   if (d.t && Array.isArray(d.t) && d.t.length > 0) {
     return d.t.map((t, i) => ({
       time:   parseInt(t),
@@ -399,27 +411,18 @@ async function handleCandles(req, res) {
   if (!store.token || !store.instrId || !store.infoRouteId) {
     return send(res, 503, { bars: [], source: 'none', error: 'Not connected to TradeLocker. Connect first.' });
   }
-  // Try every known TL history endpoint variant — clientapi is what TL's own app uses
+  // Per the documented API (public-api.tradelocker.com/reference/gethistory):
+  // GET /trade/history?tradableInstrumentId&routeId&resolution&from&to
+  // from/to MUST be unix milliseconds (the earlier seconds-based calls were the
+  // reason this always fell back to the NDX-calibrated path — TL was reading
+  // the range as an instant near 1970 and reporting no/invalid data).
   const fromMs = fromSecs * 1000;
   const nowMs  = now * 1000;
   const attempts = [
-    // Variant 1: standard /trade/history with INFO routeId (seconds)
-    `/trade/history?tradableInstrumentId=${store.instrId}&routeId=${store.infoRouteId}&resolution=${tlRes}&from=${fromSecs}&to=${now}`,
-    // Variant 2: clientapi path (TL web app uses this internally) with seconds
-    `/clientapi/v1/history?tradableInstrumentId=${store.instrId}&routeId=${store.infoRouteId}&resolution=${tlRes}&from=${fromSecs}&to=${now}`,
-    // Variant 3: clientapi with milliseconds
-    `/clientapi/v1/history?tradableInstrumentId=${store.instrId}&routeId=${store.infoRouteId}&resolution=${tlRes}&from=${fromMs}&to=${nowMs}`,
-    // Variant 4: /trade/history without routeId
-    `/trade/history?tradableInstrumentId=${store.instrId}&resolution=${tlRes}&from=${fromSecs}&to=${now}`,
-    // Variant 5: clientapi without routeId, milliseconds
-    `/clientapi/v1/history?tradableInstrumentId=${store.instrId}&resolution=${tlRes}&from=${fromMs}&to=${nowMs}`,
-    // Variant 6: TRADE route
+    `/trade/history?tradableInstrumentId=${store.instrId}&routeId=${store.infoRouteId}&resolution=${tlRes}&from=${fromMs}&to=${nowMs}`,
+    // Fallback: some instruments only expose history on the TRADE route
     store.tradeRouteId !== store.infoRouteId
-      ? `/trade/history?tradableInstrumentId=${store.instrId}&routeId=${store.tradeRouteId}&resolution=${tlRes}&from=${fromSecs}&to=${now}`
-      : null,
-    // Variant 7: clientapi TRADE route milliseconds
-    store.tradeRouteId !== store.infoRouteId
-      ? `/clientapi/v1/history?tradableInstrumentId=${store.instrId}&routeId=${store.tradeRouteId}&resolution=${tlRes}&from=${fromMs}&to=${nowMs}`
+      ? `/trade/history?tradableInstrumentId=${store.instrId}&routeId=${store.tradeRouteId}&resolution=${tlRes}&from=${fromMs}&to=${nowMs}`
       : null,
   ].filter(Boolean);
 
@@ -929,7 +932,7 @@ function startQuoteStream() {
     for (const tf of targets) {
       try {
         const from = now - tf.lookback;
-        const p    = `/trade/history?tradableInstrumentId=${store.instrId}&routeId=${store.infoRouteId}&resolution=${tf.res}&from=${from}&to=${now}`;
+        const p    = `/trade/history?tradableInstrumentId=${store.instrId}&routeId=${store.infoRouteId}&resolution=${tf.res}&from=${from * 1000}&to=${now * 1000}`;
         const r    = await tlApiFetch('GET', p, null, store.token, store.accNum);
         const bars = parseTLBars(r.json);
         if (bars.length > 0) {
@@ -982,7 +985,7 @@ async function handleBacktest(req, res) {
   }
   const now  = Math.floor(Date.now() / 1000);
   const from = now - 60 * 60 * 24 * 35; // 35 days back
-  const path = `/trade/history?tradableInstrumentId=${store.instrId}&routeId=${store.infoRouteId}&resolution=1H&from=${from}&to=${now}`;
+  const path = `/trade/history?tradableInstrumentId=${store.instrId}&routeId=${store.infoRouteId}&resolution=1H&from=${from * 1000}&to=${now * 1000}`;
   console.log(`  [TL] Backtest 1H → 35 days`);
   const r    = await tlApiFetch('GET', path, null, store.token, store.accNum);
   const bars = parseTLBars(r.json);
