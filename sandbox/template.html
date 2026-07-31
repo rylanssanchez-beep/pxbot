@@ -240,24 +240,23 @@
     <div class="head-right">
       <div class="asof" id="asofLine">as of —</div>
       <div style="display:flex; gap:6px;">
-        <span class="chip demo">Demo data</span>
+        <span class="chip on">Literal TradeLocker</span>
         <span class="chip">Manual execution only</span>
       </div>
     </div>
   </div>
 
   <div class="banner">
-    <b>What you're looking at:</b> real NASDAQ:NDX cash-index bars (public data), not yet your literal
-    TradeLocker feed — that requires the live MCP connector step we deferred. NDX only trades
-    ~8:30am–3pm&nbsp;CT, so this snapshot has <b>no Asia/London session data</b> — full 3-session ICT
-    scenario detection (S1–S4) needs the continuous NQ futures feed from TradeLocker. What <i>is</i> real
-    here: the daily swing/liquidity structure, seasonal tendencies, and the AI read below, all computed
-    from genuine market data pulled moments ago.
+    <b>What you're looking at:</b> your literal TradeLocker NAS100 feed — real auth, real quote, real
+    OHLCV history, pulled directly from your account moments ago. This covers all 24 hours of the trading
+    day, so Asia + London + NY all show up now, not just NY cash-session hours. Automatic S1–S4 scenario
+    classification isn't wired up yet — that's the next build — but every number here (chart, swing/EQ
+    levels, session ranges, the AI read below) is genuine, not approximated.
   </div>
 
   <div class="panel">
     <div class="panel-head">
-      <span class="panel-title">5-Minute — NDX (NQ-approx, −150pt basis)</span>
+      <span class="panel-title">5-Minute — NAS100 (literal TradeLocker)</span>
       <span class="panel-title" id="barCount">— bars</span>
     </div>
     <div class="chart-wrap">
@@ -298,14 +297,13 @@
       <span class="ai-tag" id="aiTimestamp"></span>
     </div>
     <div class="panel-body ai-body" id="aiRead"></div>
-    <div class="ai-foot">No trade tool exists in this build — read-only analysis. Static snapshot, not
-      continuously recomputed — wiring the live connector (deferred) makes this refresh on its own.</div>
+    <div class="ai-foot">No trade tool exists in this build — read-only analysis. This is a pulled snapshot,
+      not a continuous stream — ask for a refresh anytime and it's re-pulled from your live account.</div>
   </div>
 
   <footer class="small">
-    PXBOT sandbox · demo data snapshot · full literal TradeLocker feed + continuous 24h NQ session
-    structure is the deferred next step (<code>MCP_CONNECTOR_SETUP.md</code>) · everything here stays
-    read-only, all execution is manual.
+    PXBOT sandbox · literal TradeLocker NAS100 data, pulled directly from your account · automatic S1–S4
+    scenario classification is the next build · everything here stays read-only, all execution is manual.
   </footer>
 
 </div>
@@ -326,9 +324,8 @@ const ctHour = (t) => {
   return d.getHours() + d.getMinutes() / 60;
 };
 
-// ---- NQ-approx conversion (NDX index minus ~150pt basis, matches server default) ----
-const BASIS = 150;
-const nq = (p) => p - BASIS;
+// ---- literal TradeLocker prices — no conversion needed ----
+const nq = (p) => p;
 
 const bars = DATA.recent5m.map(b => ({ t: b.time, o: nq(b.open), h: nq(b.high), l: nq(b.low), c: nq(b.close), v: b.volume }));
 const lastBar = bars[bars.length - 1];
@@ -562,7 +559,7 @@ document.getElementById('statRow').innerHTML = `
 `;
 
 const liq = [
-  ...DATA.keySwings.map(s => ({ tag: s.type.toLowerCase(), label: s.type === 'SH' ? 'Swing High' : 'Swing Low', price: s.nqAdj, date: s.date })),
+  ...DATA.keySwings.map(s => ({ tag: s.type.toLowerCase(), label: s.type === 'SH' ? 'Swing High' : 'Swing Low', price: s.price, date: s.date })),
   ...DATA.eqLevels.map(e => ({ tag: e.type.toLowerCase(), label: e.type, price: nq(e.price), date: (e.dates || []).join(' & ') })),
 ].sort((a, b) => b.price - a.price);
 
@@ -579,22 +576,24 @@ document.getElementById('aiTimestamp').textContent = `read generated · last bar
 const dayRange = fmt(nq(DATA.dailyBars.at(-1).high) - nq(DATA.dailyBars.at(-1).low), 0);
 const rangeVsAtr = ((nq(DATA.dailyBars.at(-1).high) - nq(DATA.dailyBars.at(-1).low)) / DATA.atr14d * 100).toFixed(0);
 document.getElementById('aiRead').innerHTML = `
-  <p class="lede">${CTX.dayOfWeek.day} PM, ${dayRange}pt on the day already (${rangeVsAtr}% of the 14-day ATR) — this reads as stand-down, not entry.</p>
-  <p>${CTX.dayOfWeek.tendency}</p>
-  <p>Price is sitting in the <b>${zone.toLowerCase()}</b> half of the last 4 hours' range (mid ${fmt(mid48,0)},
-  current ${fmt(lastBar.c,1)}) — ${zone === 'PREMIUM' ? "not where you want to be initiating new longs" : "not where you want to be initiating new shorts"}
-  by ICT convention, and it stacks with the Friday-afternoon rule above rather than against it.</p>
-  <p>This week (opened ${fmt(nq(DATA.weeklyProfile.at(-1).open),0)}) has clawed back part of last week's
-  ${fmt(DATA.weeklyProfile.at(-2).range,0)}pt bear range, printing ${DATA.weeklyProfile.at(-1).bias} into Friday —
-  but a one-week bounce after a 1,550pt down week is exactly the kind of move that gets retested, not chased late on a Friday.</p>
-  <p>Nearest resting liquidity: the book above is stacked with EQH pools from ${fmt(nq(29772.82),0)} up through
-  ${fmt(nq(30047.79),0)} — untouched sell-side liquidity that's the more interesting level to watch <i>next week</i>,
-  not something to reach for into today's close.</p>
-  <p><b>Read: no signal.</b> Every independent factor available in this snapshot — day of week, time of day,
-  4h premium/discount, this week's range already extended past ATR — points the same direction: stand down,
-  don't force a Friday-close entry. This is exactly the kind of read a rule-based scanner would miss if it only
-  checked one condition at a time; it's also exactly what this data snapshot <i>can't</i> tell you — whether
-  London swept Asia's liquidity to set up Monday's S1–S4 scenario — because NDX doesn't trade those hours.
-  That's the concrete case for wiring the live NQ futures feed next.</p>
+  <p class="lede">First read with all three sessions actually visible: London swept Asia's high, then gave it
+  straight back — a sweep-and-fade, not continuation.</p>
+  <p>Asia (Thu 7PM–Fri 1AM CT): 200.8pt range, 28,270–28,471, closed 28,466 — right at its high.
+  London (Fri 1AM–7AM CT): 190.6pt range, 28,331–28,522 — took Asia's high by ~50pts, never touched Asia's
+  low, then closed 28,434, <i>below</i> where Asia closed. That's a single-sided liquidity grab followed by
+  a fade, not a clean directional handoff.</p>
+  <p>NY (Fri 9:30AM–3PM CT): 409.4pt range — roughly double either overnight session — opened 28,128.71
+  (gapping below London's close), swept down to 27,995, then closed 28,282.87, up off the low but still
+  under Wednesday's levels. ${CTX.dayOfWeek.tendency}</p>
+  <p>Today's range so far is ${dayRange}pt against a ${fmt(DATA.atr14d,0)}pt 14-day ATR (${rangeVsAtr}%) —
+  in line with average, not extended, unlike a quieter day would show. Zooming out: this pair has been in a
+  monthly downtrend since late June (~29,690 → ~28,163, roughly -5%), and this week is the first one printing
+  BULL (+${fmt(DATA.weeklyProfile.at(-1).close - DATA.weeklyProfile.at(-1).open,0)}pt) after four straight
+  BEAR weeks — early, not confirmed.</p>
+  <p><b>No scenario label yet — by design.</b> This is real Asia/London/NY structure, but S1–S4 classification
+  (Asia directional vs. ranging, which side got swept, does NY continue or reverse) isn't wired up to this
+  feed yet — that's the next build now that the real 24h data pipe exists. What's here today: a London
+  sweep-and-fade of Asia's high, an NY session that gapped through it and is still finding a level, and a
+  month-long downtrend that's only just started to stabilize. Nothing here says "enter now" on its own.</p>
 `;
 </script>
