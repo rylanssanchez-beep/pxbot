@@ -129,6 +129,50 @@ function variantTightStopWideTarget(bias, levels, entryPrice, bars, legLow, legH
   return { r: 0, exit: 'TIMEOUT' };
 }
 
+// Bank 50% at TP1 always (a small win locked in immediately). For the other
+// 50%: move its stop to breakeven and give it up to `confirmBars` bars to
+// prove continuation (make a new favorable extreme beyond TP1) BEFORE it
+// touches breakeven again. If it confirms, hold for TP2/TP3, trailing the
+// stop up to TP1 once TP2 prints. If it stalls/reverses first, take the
+// remainder off at breakeven — the "be cautious, take the small win" case.
+function variantPartialAdaptive(bias, levels, entryPrice, bars, legLow, legHigh, confirmBars = 10) {
+  const risk = Math.abs(entryPrice - levels.sl);
+  if (risk <= 0) return null;
+  const r1 = Math.abs(levels.tp1 - entryPrice) / risk;
+  let stage = 'pre-tp1', stop = levels.sl, banked = 0, confirmCountdown = 0, bestSinceTp1 = null;
+
+  for (const b of bars) {
+    if (stage === 'pre-tp1') {
+      const hitStop = bias === 'BUY' ? b.low <= stop : b.high >= stop;
+      if (hitStop) return { r: -1, exit: 'SL' };
+      const hitTP1 = bias === 'BUY' ? b.high >= levels.tp1 : b.low <= levels.tp1;
+      if (hitTP1) { banked = 0.5 * r1; stage = 'confirming'; stop = entryPrice; confirmCountdown = confirmBars; bestSinceTp1 = bias === 'BUY' ? b.high : b.low; continue; }
+      continue;
+    }
+    if (stage === 'confirming') {
+      bestSinceTp1 = bias === 'BUY' ? Math.max(bestSinceTp1, b.high) : Math.min(bestSinceTp1, b.low);
+      const confirmed = bias === 'BUY' ? bestSinceTp1 > levels.tp1 : bestSinceTp1 < levels.tp1; // made a new extreme beyond TP1
+      const hitStop = bias === 'BUY' ? b.low <= stop : b.high >= stop;
+      if (hitStop) return { r: banked, exit: confirmed ? 'BE-remainder-after-confirm' : 'BE-remainder-cautious' };
+      const hitTP3 = bias === 'BUY' ? b.high >= levels.tp3 : b.low <= levels.tp3;
+      if (hitTP3) return { r: banked + 0.5 * (Math.abs(levels.tp3 - entryPrice) / risk), exit: 'TP3-remainder' };
+      const hitTP2 = bias === 'BUY' ? b.high >= levels.tp2 : b.low <= levels.tp2;
+      if (hitTP2) { stage = 'riding'; stop = levels.tp1; continue; }
+      confirmCountdown--;
+      if (confirmCountdown <= 0 && !confirmed) return { r: banked, exit: 'BE-remainder-timeout-cautious' };
+      continue;
+    }
+    if (stage === 'riding') {
+      const hitStop = bias === 'BUY' ? b.low <= stop : b.high >= stop;
+      if (hitStop) return { r: banked + 0.5 * r1, exit: 'TP1-lock-remainder' };
+      const hitTP3 = bias === 'BUY' ? b.high >= levels.tp3 : b.low <= levels.tp3;
+      if (hitTP3) return { r: banked + 0.5 * (Math.abs(levels.tp3 - entryPrice) / risk), exit: 'TP3-remainder' };
+    }
+  }
+  if (stage === 'pre-tp1') return { r: 0, exit: 'TIMEOUT-no-entry-progress' };
+  return { r: banked, exit: 'TIMEOUT' };
+}
+
 // Isolates "let it run further" from "tighten the stop" — same original
 // stop as baseline, single exit at TP3 instead of the TP1/2/3 ladder.
 function variantWideTargetSameStop(bias, levels, entryPrice, bars) {
@@ -147,6 +191,7 @@ const VARIANTS = {
   baseline: variantBaseline,
   breakeven_ladder: variantBreakevenLadder,
   partial_50_50: variantPartial5050,
+  partial_adaptive: variantPartialAdaptive,
   tight_sl_wide_target: variantTightStopWideTarget,
   wide_target_same_stop: variantWideTargetSameStop,
 };
@@ -179,15 +224,15 @@ const VARIANTS = {
   console.log(`${trades.length} entries found (same entry set for every variant below).\n`);
 
   for (const [name, fn] of Object.entries(VARIANTS)) {
-    let totalR = 0, wins = 0, losses = 0, n = 0;
+    let totalR = 0, wins = 0, losses = 0, breakevens = 0, n = 0;
     for (const t of trades) {
       const res = fn(t.bias, t.levels, t.entryPrice, t.forwardBars, t.legLow, t.legHigh);
       if (!res) continue;
       n++;
       totalR += res.r;
-      if (res.r > 0) wins++; else if (res.r < 0) losses++;
+      if (res.r > 0.001) wins++; else if (res.r < -0.001) losses++; else breakevens++;
     }
-    console.log(`${name}: n=${n}  totalR=${totalR.toFixed(2)}  avgR=${(totalR / n).toFixed(3)}  wins=${wins} losses=${losses} (${(100 * wins / n).toFixed(1)}% strict-win)`);
+    console.log(`${name}: n=${n}  totalR=${totalR.toFixed(2)}  avgR=${(totalR / n).toFixed(3)}  wins=${wins} losses=${losses} scratches=${breakevens}  (full-win rate ${(100 * wins / (wins + losses || 1)).toFixed(1)}%, non-loss rate ${(100 * (wins + breakevens) / n).toFixed(1)}%)`);
   }
 
   console.log('\nSample size reminder: n is in the 30s. Directionally informative, not statistically proven.');
@@ -200,7 +245,7 @@ const VARIANTS = {
 
   for (const minLeg of thresholds) {
     const filtered = trades.filter(t => Math.abs(t.legHigh - t.legLow) >= minLeg);
-    for (const name of ['baseline', 'breakeven_ladder']) {
+    for (const name of ['baseline', 'breakeven_ladder', 'partial_adaptive']) {
       const fn = VARIANTS[name];
       let totalR = 0, n = 0;
       for (const t of filtered) {
@@ -225,7 +270,7 @@ const VARIANTS = {
     const train = filtered.slice(0, splitIdx), test = filtered.slice(splitIdx);
     const score = arr => {
       let r = 0, n = 0;
-      for (const t of arr) { const res = VARIANTS.breakeven_ladder(t.bias, t.levels, t.entryPrice, t.forwardBars); if (!res) continue; n++; r += res.r; }
+      for (const t of arr) { const res = VARIANTS.partial_adaptive(t.bias, t.levels, t.entryPrice, t.forwardBars); if (!res) continue; n++; r += res.r; }
       return { n, totalR: +r.toFixed(2), avgR: n ? +(r / n).toFixed(3) : null };
     };
     const trainScore = score(train), testScore = score(test);
