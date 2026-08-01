@@ -151,6 +151,34 @@
   .crosshair-readout .up { color: var(--bull); }
   .crosshair-readout .dn { color: var(--bear); }
 
+  /* ---- Replay bar ---- */
+  .replay-bar {
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 16px 14px; margin-top: -4px;
+    border-top: 1px solid var(--border-soft);
+  }
+  .replay-btn {
+    font-family: var(--mono); font-size: 13px; line-height: 1;
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 4px; padding: 6px 10px; cursor: pointer;
+  }
+  .replay-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .replay-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .replay-btn.playing { color: var(--accent); border-color: var(--accent); }
+  .replay-live { font-size: 10.5px; letter-spacing: 0.05em; font-weight: 600; }
+  .replay-live.is-live { color: var(--bull); border-color: color-mix(in srgb, var(--bull) 45%, var(--border)); }
+  .replay-scrub {
+    flex: 1 1 auto; accent-color: var(--accent); cursor: pointer;
+  }
+  .replay-time {
+    font-family: var(--mono); font-size: 11.5px; color: var(--text-faint);
+    min-width: 108px; text-align: right; font-variant-numeric: tabular-nums;
+  }
+  .replay-speed {
+    font-family: var(--mono); font-size: 11.5px; background: var(--panel-2);
+    color: var(--text-dim); border: 1px solid var(--border); border-radius: 4px; padding: 5px 6px;
+  }
+
   /* ---- Session strip ---- */
   .strip {
     display: flex; flex-wrap: wrap; gap: 8px;
@@ -256,7 +284,7 @@
 
   <div class="panel">
     <div class="panel-head">
-      <span class="panel-title">5-Minute — NAS100 (literal TradeLocker)</span>
+      <span class="panel-title">1-Minute — NAS100 (literal TradeLocker)</span>
       <span class="panel-title" id="barCount">— bars</span>
     </div>
     <div class="chart-wrap">
@@ -268,6 +296,20 @@
       <span class="lg-item"><span class="lg-swatch" style="background:color-mix(in srgb, var(--bear) 55%, transparent)"></span>Premium zone (upper half, last 4h range)</span>
       <span class="lg-item"><span class="lg-swatch" style="background:color-mix(in srgb, var(--bull) 55%, transparent)"></span>Discount zone</span>
       <span class="lg-item"><span class="lg-swatch" style="background:var(--warn)"></span>Last price</span>
+    </div>
+    <div class="replay-bar">
+      <button id="replayPlay" class="replay-btn" title="Play/pause">▶</button>
+      <button id="replayStepBack" class="replay-btn" title="Step back one bar">⏮</button>
+      <button id="replayStepFwd" class="replay-btn" title="Step forward one bar">⏭</button>
+      <input id="replayScrub" type="range" min="19" max="259" value="259" class="replay-scrub" />
+      <span id="replayTime" class="replay-time">live</span>
+      <select id="replaySpeed" class="replay-speed">
+        <option value="600">0.5×</option>
+        <option value="300" selected>1×</option>
+        <option value="120">2.5×</option>
+        <option value="40">7×</option>
+      </select>
+      <button id="replayLive" class="replay-btn replay-live" title="Jump back to the latest bar">LIVE</button>
     </div>
   </div>
 
@@ -349,11 +391,11 @@ const ctHour = (t) => {
 // ---- literal TradeLocker prices — no conversion needed ----
 const nq = (p) => p;
 
-const bars = DATA.recent5m.map(b => ({ t: b.time, o: nq(b.open), h: nq(b.high), l: nq(b.low), c: nq(b.close), v: b.volume }));
+const bars = DATA.recent1m.map(b => ({ t: b.time, o: nq(b.open), h: nq(b.high), l: nq(b.low), c: nq(b.close), v: b.volume }));
 const lastBar = bars[bars.length - 1];
 
 document.getElementById('asofLine').textContent = `as of ${ctParts(lastBar.t)} CT — last bar`;
-document.getElementById('barCount').textContent = `${bars.length} bars · ${DATA.dateRange}`;
+document.getElementById('barCount').textContent = `${bars.length} bars · ${fmtDate(bars[0].t)} – ${fmtDate(bars[bars.length-1].t)}`;
 
 // ---- EMA20 ----
 function ema(values, period) {
@@ -365,18 +407,27 @@ function ema(values, period) {
 }
 const ema20 = ema(bars.map(b => b.c), 20);
 
-// ---- Premium / discount zone over last 48 bars (~4h) ----
-const window48 = bars.slice(-48);
-const hi48 = Math.max(...window48.map(b => b.h));
-const lo48 = Math.min(...window48.map(b => b.l));
-const mid48 = (hi48 + lo48) / 2;
-const zone = lastBar.c > mid48 ? 'PREMIUM' : 'DISCOUNT';
+// ---- Premium / discount zone over last 48 bars (~4h) — recomputed per replay position below ----
+let hi48, lo48, mid48, zone;
+function computePremiumDiscount(uptoIdx) {
+  const window48 = bars.slice(Math.max(0, uptoIdx - 239), uptoIdx + 1);
+  hi48 = Math.max(...window48.map(b => b.h));
+  lo48 = Math.min(...window48.map(b => b.l));
+  mid48 = (hi48 + lo48) / 2;
+  zone = bars[uptoIdx].c > mid48 ? 'PREMIUM' : 'DISCOUNT';
+}
+computePremiumDiscount(bars.length - 1);
 
 // ================= Candlestick + volume canvas =================
 const canvas = document.getElementById('chart');
 const ctx2d = canvas.getContext('2d');
 const readout = document.getElementById('readout');
 let hoverIdx = null;
+
+// ---- Bar replay state — TradingView-replay-style scrub/play/step ----
+let replayCursor = bars.length - 1; // index of the last VISIBLE bar; bars.length-1 = fully live
+let replayPlaying = false;
+let replayTimer = null;
 
 function cssVar(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
 
@@ -395,17 +446,22 @@ function draw() {
   const priceTop = padTop;
   const volTop = priceTop + priceH + 14;
 
-  const n = bars.length;
+  const n = bars.length; // fixed x-scale so candle positions don't shift as replay reveals them
   const slot = (W - padRight) / n;
   const bw = Math.max(2, slot * 0.62);
 
-  const hi = Math.max(...bars.map(b => b.h));
-  const lo = Math.min(...bars.map(b => b.l));
+  const visible = bars.slice(0, replayCursor + 1);
+  const visibleEma = ema20.slice(0, replayCursor + 1);
+  computePremiumDiscount(replayCursor);
+  const lastVisible = bars[replayCursor];
+
+  const hi = Math.max(...visible.map(b => b.h));
+  const lo = Math.min(...visible.map(b => b.l));
   const pad = (hi - lo) * 0.06;
   const yMax = hi + pad, yMin = lo - pad;
   const y = (p) => priceTop + (1 - (p - yMin) / (yMax - yMin)) * priceH;
 
-  const maxVol = Math.max(...bars.map(b => b.v));
+  const maxVol = Math.max(...visible.map(b => b.v));
   const yv = (v) => volTop + volH - (v / maxVol) * volH;
 
   const border = cssVar('--border-soft') || '#1a2030';
@@ -439,8 +495,8 @@ function draw() {
   ctx2d.fillStyle = hexA(bull, 0.07);
   ctx2d.fillRect(0, yMid48, W - padRight, yLo48 - yMid48);
 
-  // candles
-  bars.forEach((b, i) => {
+  // candles — only up to the replay cursor; the rest of the timeline stays blank ("the future")
+  visible.forEach((b, i) => {
     const cx = i * slot + slot / 2;
     const up = b.c >= b.o;
     ctx2d.strokeStyle = up ? bull : bear;
@@ -463,15 +519,15 @@ function draw() {
   ctx2d.strokeStyle = accent;
   ctx2d.lineWidth = 1.4;
   ctx2d.beginPath();
-  ema20.forEach((v, i) => {
+  visibleEma.forEach((v, i) => {
     const cx = i * slot + slot / 2;
     const yy = y(v);
     if (i === 0) ctx2d.moveTo(cx, yy); else ctx2d.lineTo(cx, yy);
   });
   ctx2d.stroke();
 
-  // last price dashed line
-  const yLast = y(lastBar.c);
+  // last visible price dashed line
+  const yLast = y(lastVisible.c);
   ctx2d.setLineDash([4, 3]);
   ctx2d.strokeStyle = warn;
   ctx2d.lineWidth = 1;
@@ -484,7 +540,7 @@ function draw() {
   ctx2d.fillRect(W - padRight, yLast - 8, padRight, 16);
   ctx2d.fillStyle = '#0b0e14';
   ctx2d.font = 'bold 10px ' + (cssVar('--mono') || 'monospace');
-  ctx2d.fillText(fmt(lastBar.c, 1), W - padRight + 4, yLast + 3);
+  ctx2d.fillText(fmt(lastVisible.c, 1), W - padRight + 4, yLast + 3);
 
   // volume panel border
   ctx2d.strokeStyle = border;
@@ -493,11 +549,11 @@ function draw() {
   ctx2d.lineTo(W - padRight, volTop - 6);
   ctx2d.stroke();
 
-  // day separators + date labels (detect gaps > 20min between bars)
+  // day separators + date labels (detect gaps > 20min between bars) — only through the visible range
   ctx2d.fillStyle = textFaint;
   ctx2d.font = '10px ' + (cssVar('--mono') || 'monospace');
   let lastDay = null;
-  bars.forEach((b, i) => {
+  visible.forEach((b, i) => {
     const day = fmtDate(b.t);
     if (day !== lastDay) {
       const cx = i * slot;
@@ -529,7 +585,7 @@ canvas.addEventListener('mousemove', (e) => {
   const rect = canvas.getBoundingClientRect();
   const x = e.clientX - rect.left;
   let idx = Math.floor(x / geom.slot);
-  idx = Math.max(0, Math.min(bars.length - 1, idx));
+  idx = Math.max(0, Math.min(replayCursor, idx)); // never show hover info past the replay cursor ("the future")
   const b = bars[idx];
   const up = b.c >= b.o;
   readout.style.display = 'block';
@@ -540,6 +596,64 @@ canvas.addEventListener('mouseleave', () => { readout.style.display = 'none'; })
 window.addEventListener('resize', draw);
 new MutationObserver(draw).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
 window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', draw);
+
+// ================= Replay controls — TradingView-replay-style scrub/play/step =================
+const replayPlayBtn  = document.getElementById('replayPlay');
+const replayScrub    = document.getElementById('replayScrub');
+const replayTimeEl   = document.getElementById('replayTime');
+const replaySpeedEl  = document.getElementById('replaySpeed');
+const replayLiveBtn  = document.getElementById('replayLive');
+const MIN_REPLAY_IDX = 19; // need at least 20 bars for EMA20 to mean anything
+
+replayScrub.min = String(MIN_REPLAY_IDX);
+replayScrub.max = String(bars.length - 1);
+replayScrub.value = String(bars.length - 1);
+
+function updateReplayUI() {
+  replayScrub.value = String(replayCursor);
+  const isLive = replayCursor === bars.length - 1;
+  replayTimeEl.textContent = isLive ? 'live' : ctParts(bars[replayCursor].t) + ' CT';
+  replayLiveBtn.classList.toggle('is-live', isLive);
+  replayPlayBtn.textContent = replayPlaying ? '⏸' : '▶';
+  replayPlayBtn.classList.toggle('playing', replayPlaying);
+}
+
+function setCursor(idx) {
+  replayCursor = Math.max(MIN_REPLAY_IDX, Math.min(bars.length - 1, idx));
+  if (replayCursor >= bars.length - 1) stopPlaying();
+  updateReplayUI();
+  draw();
+}
+
+function stopPlaying() {
+  replayPlaying = false;
+  if (replayTimer) { clearInterval(replayTimer); replayTimer = null; }
+  updateReplayUI();
+}
+
+function startPlaying() {
+  if (replayCursor >= bars.length - 1) replayCursor = MIN_REPLAY_IDX; // restart from the beginning if already live
+  replayPlaying = true;
+  updateReplayUI();
+  const tick = () => {
+    if (replayCursor >= bars.length - 1) { stopPlaying(); return; }
+    setCursor(replayCursor + 1);
+  };
+  if (replayTimer) clearInterval(replayTimer);
+  replayTimer = setInterval(tick, Number(replaySpeedEl.value));
+}
+
+replayPlayBtn.addEventListener('click', () => { replayPlaying ? stopPlaying() : startPlaying(); });
+document.getElementById('replayStepBack').addEventListener('click', () => { stopPlaying(); setCursor(replayCursor - 1); });
+document.getElementById('replayStepFwd').addEventListener('click', () => { stopPlaying(); setCursor(replayCursor + 1); });
+replayLiveBtn.addEventListener('click', () => { stopPlaying(); setCursor(bars.length - 1); });
+replayScrub.addEventListener('input', () => {
+  const target = Number(replayScrub.value); // capture BEFORE stopPlaying()'s updateReplayUI() resets the slider's value
+  stopPlaying();
+  setCursor(target);
+});
+replaySpeedEl.addEventListener('change', () => { if (replayPlaying) startPlaying(); }); // restart interval at new speed
+updateReplayUI();
 draw();
 
 // ================= Session strip =================

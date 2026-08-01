@@ -77,24 +77,24 @@ function weeklyProfile(daily) {
     process.exit(1);
   }
 
-  const [m5, h1, d1, ctx] = await Promise.all([
-    get('/api/candles?resolution=5&count=10000'),
+  const [m1, h1, d1, ctx] = await Promise.all([
+    get('/api/candles?resolution=1&count=19000'), // 1-minute — precise entries, ~1 trading day per pull
     get('/api/candles?resolution=60&count=1500'),
     get('/api/candles?resolution=1440&count=500'),
     get('/api/context'),
   ]);
 
-  if (!m5.bars || !m5.bars.length || !d1.bars || !d1.bars.length) {
-    console.error('No literal TradeLocker bars came back yet (source:', m5.source, '). Let the connection settle and retry.');
+  if (!m1.bars || !m1.bars.length || !d1.bars || !d1.bars.length) {
+    console.error('No literal TradeLocker bars came back yet (source:', m1.source, '). Let the connection settle and retry.');
     process.exit(1);
   }
-  if (m5.source !== 'tradelocker' || d1.source !== 'tradelocker') {
-    console.warn(`Warning: candles came back as source="${m5.source}"/"${d1.source}", not "tradelocker" — this snapshot may still be the NDX-calibrated fallback.`);
+  if (m1.source !== 'tradelocker' || d1.source !== 'tradelocker') {
+    console.warn(`Warning: candles came back as source="${m1.source}"/"${d1.source}", not "tradelocker" — this snapshot may still be the NDX-calibrated fallback.`);
   }
 
   const daily = d1.bars;
   const data = {
-    recent5m:      m5.bars.slice(-260),
+    recent1m:      m1.bars.slice(-700),
     dailyBars:     daily.slice(-20),
     weeklyProfile: weeklyProfile(daily).slice(-6),
     keySwings:     findSwings(daily).slice(-18),
@@ -102,7 +102,7 @@ function weeklyProfile(daily) {
     atr14d:        atr14(daily),
     lastClose:     daily[daily.length - 1].close,
     dateRange:     `${fmtDate(daily[0].time)} → ${fmtDate(daily[daily.length - 1].time)}`,
-    barCounts:     { m5: m5.bars.length, h1: h1.bars.length, d1: daily.length },
+    barCounts:     { m1: m1.bars.length, h1: h1.bars.length, d1: daily.length },
   };
   const ctxOut = {
     dayOfWeek:       ctx.dayOfWeek,
@@ -119,7 +119,7 @@ function weeklyProfile(daily) {
 
   const outPath = path.join(__dirname, '..', 'sandbox_snapshot.html');
   fs.writeFileSync(outPath, out);
-  console.log(`Wrote ${outPath} — ${data.recent5m.length} literal 5m bars, ${data.dailyBars.length} daily, covering ${data.dateRange}.`);
+  console.log(`Wrote ${outPath} — ${data.recent1m.length} literal 1m bars, ${data.dailyBars.length} daily, covering ${data.dateRange}.`);
   console.log('Open it directly in a browser, or paste it to Claude and ask to republish the sandbox Artifact.');
   console.log('Note: the "AI Read" panel is written prose, not a recomputed template — ask Claude to rewrite');
   console.log('that paragraph for the new data when you hand off a fresh snapshot.');
