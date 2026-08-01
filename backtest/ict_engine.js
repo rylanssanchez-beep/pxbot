@@ -5,14 +5,18 @@
 // deterministic rules over continuous OHLC bars, so it can be run against real
 // history instead of only existing as prompt text for an LLM to interpret.
 //
-// Thresholds below are named constants specifically so they're one-line changes
-// once backtest results say a threshold is wrong — that's the actual
-// "self-improving" mechanism for this system: real outcomes tune real numbers.
+// All tunable knobs live in DEFAULT_THRESHOLDS and are threaded through every
+// function as a parameter (never read from module scope) so backtest/sweep.js
+// can grid-search them — that's the actual "self-improving" mechanism here:
+// real outcomes tune real numbers, verified out-of-sample, not vibes.
 
-const THRESHOLDS = {
+const DEFAULT_THRESHOLDS = {
   directionalRatio: 0.55, // |close-open| / range above this = "directional", at/below = "ranging"
   sweepEpsilonPts:  1.0,  // London must clear Asia's extreme by more than this to count as a sweep
   slBufferPct:      0.05, // stop sits this fraction of leg size beyond the leg's origin extreme
+  oteLo:            0.618, // OTE retracement band, fraction of leg size from the leg's terminal point
+  oteHi:            0.705,
+  allowedDaysOfWeek: [0, 1, 2, 3, 4, 5, 6], // 0=Sun..6=Sat (CT date of the NY session) — filter for day-of-week gating
 };
 
 function ctParts(unixSecs) {
@@ -28,54 +32,61 @@ function rangeOf(bars) {
   };
 }
 
-function isDirectional(r) {
+function isDirectional(r, th) {
   const size = r.high - r.low;
   if (size <= 0) return false;
-  return Math.abs(r.close - r.open) / size > THRESHOLDS.directionalRatio;
+  return Math.abs(r.close - r.open) / size > th.directionalRatio;
 }
 
-// Slice continuous bars into per-calendar-day Asia/London/NY/afterhours windows,
-// keyed by the NY session's calendar date (CT).
+// Slicing is threshold-independent but a sweep calls this with the SAME bars
+// array across thousands of parameter combinations — cache by array identity
+// so the (relatively expensive, timezone-formatting-heavy) slice only runs once.
+const _sliceCache = new WeakMap();
+
 function sliceSessions(bars) {
-  const byDate = new Map(); // dateKey -> { asia:[], london:[], ny:[], forward:[] }
+  if (_sliceCache.has(bars)) return _sliceCache.get(bars);
+  const result = sliceSessionsUncached(bars);
+  _sliceCache.set(bars, result);
+  return result;
+}
+
+function sliceSessionsUncached(bars) {
+  const byDate = new Map(); // dateKey -> { asia:[], london:[], ny:[], forward:[], nyDow }
+  const ensure = (key, dow) => {
+    if (!byDate.has(key)) byDate.set(key, { asia: [], london: [], ny: [], forward: [], nyDow: dow });
+    return byDate.get(key);
+  };
   for (const b of bars) {
     const { hour, dateKey, jsDate } = ctParts(b.time);
-    // Asia (19:00 prev day - 01:00 this day) belongs to THIS calendar date's session
-    // London/NY/afterhours belong to their own calendar date.
     if (hour >= 19) {
       const next = new Date(jsDate); next.setDate(next.getDate() + 1);
       const key = next.toISOString().slice(0, 10);
-      if (!byDate.has(key)) byDate.set(key, { asia: [], london: [], ny: [], forward: [] });
-      byDate.get(key).asia.push(b);
+      ensure(key, next.getDay()).asia.push(b);
     } else if (hour < 1) {
-      if (!byDate.has(dateKey)) byDate.set(dateKey, { asia: [], london: [], ny: [], forward: [] });
-      byDate.get(dateKey).asia.push(b);
+      ensure(dateKey, jsDate.getDay()).asia.push(b);
     } else if (hour >= 1 && hour < 7) {
-      if (!byDate.has(dateKey)) byDate.set(dateKey, { asia: [], london: [], ny: [], forward: [] });
-      byDate.get(dateKey).london.push(b);
+      ensure(dateKey, jsDate.getDay()).london.push(b);
     } else if (hour >= 9.5 && hour < 15) {
-      if (!byDate.has(dateKey)) byDate.set(dateKey, { asia: [], london: [], ny: [], forward: [] });
-      byDate.get(dateKey).ny.push(b);
+      ensure(dateKey, jsDate.getDay()).ny.push(b);
     } else if (hour >= 15) {
-      if (!byDate.has(dateKey)) byDate.set(dateKey, { asia: [], london: [], ny: [], forward: [] });
-      byDate.get(dateKey).forward.push(b);
+      ensure(dateKey, jsDate.getDay()).forward.push(b);
     }
   }
   return byDate;
 }
 
 // Classify one day's Asia+London ranges into a scenario per the SCENARIOS playbook.
-function classifyDay(asia, london) {
-  if (!asia || !london) return { id: 0, bias: 'WAIT', reason: 'insufficient data' };
+function classifyDay(asia, london, th = DEFAULT_THRESHOLDS) {
+  if (!asia || !london || !asia.length || !london.length) return { id: 0, bias: 'WAIT', reason: 'insufficient data' };
   const a = rangeOf(asia), l = rangeOf(london);
   if (!a || !l || a.high === a.low || l.high === l.low) return { id: 0, bias: 'WAIT', reason: 'flat range' };
 
-  const sweptHigh = l.high > a.high + THRESHOLDS.sweepEpsilonPts;
-  const sweptLow  = l.low  < a.low  - THRESHOLDS.sweepEpsilonPts;
+  const sweptHigh = l.high > a.high + th.sweepEpsilonPts;
+  const sweptLow  = l.low  < a.low  - th.sweepEpsilonPts;
   const sweptBoth = sweptHigh && sweptLow;
   const sweptOne  = sweptHigh !== sweptLow;
-  const asiaDir   = isDirectional(a);
-  const londonDir = isDirectional(l);
+  const asiaDir   = isDirectional(a, th);
+  const londonDir = isDirectional(l, th);
   const londonBias = l.close > l.open ? 'BUY' : 'SELL';
   const asiaBias    = a.close > a.open ? 'BUY' : 'SELL';
 
@@ -86,7 +97,6 @@ function classifyDay(asia, london) {
     return { id: 1, bias: asiaBias, legLow: l.low, legHigh: l.high, reason: 'Asia directional, London consolidated' };
   }
   if (!asiaDir && londonDir && sweptOne) {
-    // London's own range already spans the sweep point and the continuation extreme.
     return { id: 2, bias: londonBias, legLow: l.low, legHigh: l.high,
              reason: `Asia ranged, London swept Asia ${sweptHigh ? 'high' : 'low'} and continued` };
   }
@@ -98,25 +108,25 @@ function classifyDay(asia, london) {
 }
 
 // Given a classified leg, compute the OTE entry zone and TP1/TP2/TP3/SL.
-function legLevels(bias, legLow, legHigh) {
+function legLevels(bias, legLow, legHigh, th = DEFAULT_THRESHOLDS) {
   const size = legHigh - legLow;
   if (bias === 'BUY') {
     return {
-      oteHigh: +(legHigh - size * 0.618).toFixed(2),
-      oteLow:  +(legHigh - size * 0.705).toFixed(2),
+      oteHigh: +(legHigh - size * th.oteLo).toFixed(2),
+      oteLow:  +(legHigh - size * th.oteHi).toFixed(2),
       tp1: +(legLow + size * 0.5).toFixed(2),
       tp2: +legHigh.toFixed(2),
       tp3: +(legHigh + size * 0.272).toFixed(2),
-      sl:  +(legLow - size * THRESHOLDS.slBufferPct).toFixed(2),
+      sl:  +(legLow - size * th.slBufferPct).toFixed(2),
     };
   }
   return {
-    oteLow:  +(legLow + size * 0.618).toFixed(2),
-    oteHigh: +(legLow + size * 0.705).toFixed(2),
+    oteLow:  +(legLow + size * th.oteLo).toFixed(2),
+    oteHigh: +(legLow + size * th.oteHi).toFixed(2),
     tp1: +(legHigh - size * 0.5).toFixed(2),
     tp2: +legLow.toFixed(2),
     tp3: +(legLow - size * 0.272).toFixed(2),
-    sl:  +(legHigh + size * THRESHOLDS.slBufferPct).toFixed(2),
+    sl:  +(legHigh + size * th.slBufferPct).toFixed(2),
   };
 }
 
@@ -154,18 +164,20 @@ function simulateTrade(bias, levels, forwardBars, maxBars) {
 
 // Full backtest over continuous hourly (or finer) bars.
 function runBacktest(bars, opts = {}) {
-  const maxForwardBars = opts.maxForwardBars || 30; // ~30 bars forward at whatever resolution is passed in
+  const th = { ...DEFAULT_THRESHOLDS, ...(opts.thresholds || {}) };
+  const maxForwardBars = opts.maxForwardBars || 30;
   const byDate = sliceSessions(bars);
   const days = [];
 
   for (const [dateKey, sess] of byDate.entries()) {
     if (!sess.asia.length || !sess.london.length) continue;
-    const cls = classifyDay(sess.asia, sess.london);
+    if (!th.allowedDaysOfWeek.includes(sess.nyDow)) continue;
+    const cls = classifyDay(sess.asia, sess.london, th);
     const day = { date: dateKey, scenario: cls.id, bias: cls.bias, reason: cls.reason };
 
     if (cls.id === 0 || cls.id === 4) { days.push(day); continue; }
 
-    const levels = legLevels(cls.bias, cls.legLow, cls.legHigh);
+    const levels = legLevels(cls.bias, cls.legLow, cls.legHigh, th);
     const forward = [...sess.ny, ...sess.forward];
     const sim = simulateTrade(cls.bias, levels, forward, maxForwardBars);
     Object.assign(day, { levels, entered: sim.entered, result: sim.result, r: sim.r });
@@ -204,4 +216,4 @@ function runBacktest(bars, opts = {}) {
   };
 }
 
-module.exports = { THRESHOLDS, classifyDay, legLevels, simulateTrade, runBacktest, sliceSessions };
+module.exports = { DEFAULT_THRESHOLDS, classifyDay, legLevels, simulateTrade, runBacktest, sliceSessions };

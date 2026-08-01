@@ -6,3 +6,4 @@ mcp_token.json
 sandbox_snapshot.html
 node_modules/
 backtest/results.json
+backtest/sweep_results.json
