@@ -46,17 +46,15 @@ function rangeOf(bars) {
 const ICT_TRACK_RECORD = 'leg>=199pt filter: +0.349R avg train (n=18), +0.405R avg OOS (n=7) — thin sample, not proven.';
 const ICT_MIN_LEG = 199; // the one leg-size filter that held up out-of-sample
 
-// Switched from the untuned default to the config folds 1, 2, and 4 all
-// independently picked (rangeHour=9, target=0.5x) — the one part of the ORB
-// walk-forward that showed real consistency across folds instead of a
-// different "best" every time. Stop buffer (5%) matches fold 2 exactly;
-// fold 1 used 2%, fold 4 used 10% and was the one that went slightly
-// negative. This is a chosen config from real folds, not a proven constant —
-// say so plainly rather than implying it's settled.
+// Restricted to ONLY the 2 profitable walk-forward folds (1 and 2) — fold 4
+// picked this same rangeHour=9/target=0.5x shape too but went slightly
+// negative, and is deliberately excluded here per instruction. That means
+// this config is now backed by the 2 folds that worked, not a claim that
+// the shape is reliable across all folds that ever picked it — say so.
 const ORB_CONFIG = { ...DEFAULT_ORB, rangeHour: 9, targetMultiple: 0.5, slBufferPct: 0.05, minRangeSize: 100 };
-const ORB_TRACK_RECORD = 'rangeHour=9/target=0.5x config (folds 1,2,4 agreed on this): fold1 +0.184R/trade (n=58), '
-  + 'fold2 +0.055R/trade (n=79), fold4 -0.025R/trade (n=80) — 2 of 3 folds that picked this shape were profitable, '
-  + 'not all. Untuned default (rangeHour=8, target=1x) separately tested +0.077R avg across 598 trades, no tuning.';
+const ORB_TRACK_RECORD = 'rangeHour=9/target=0.5x config, folds 1+2 only (both profitable): fold1 +0.184R/trade (n=58), '
+  + 'fold2 +0.055R/trade (n=79) — combined +0.110R/trade (n=137). Fold 4 picked this same shape and went slightly '
+  + 'negative (-0.025R, n=80) — excluded from this number by request, not because it disagreed and got dropped quietly.';
 
 (async () => {
   const health = await get('/api/health');

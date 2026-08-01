@@ -764,11 +764,24 @@ function tvIntervalFor(tf) {
   return String(n);
 }
 
-function initChart() {
+const CHART_LOAD_MAX_RETRIES = 25; // ~5s at 200ms — after this, stop silently retrying and show an error
+
+function initChart(retryCount) {
+  retryCount = retryCount || 0;
   const container = $('chart');
   if (!container) return;
-  if (typeof TradingView === 'undefined') { setTimeout(initChart, 200); return; }
-  if (container.offsetWidth < 10)        { setTimeout(initChart, 200); return; }
+  if (typeof TradingView === 'undefined') {
+    if (retryCount >= CHART_LOAD_MAX_RETRIES) {
+      container.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;padding:24px;text-align:center;color:#8892a4;font-size:14px;line-height:1.6">'
+        + 'Chart failed to load — TradingView\'s widget script (s3.tradingview.com/tv.js) didn\'t respond.<br>'
+        + 'Check your internet connection, firewall, or ad-blocker (some block *.tradingview.com), then reload this page.'
+        + '</div>';
+      return;
+    }
+    setTimeout(() => initChart(retryCount + 1), 200);
+    return;
+  }
+  if (container.offsetWidth < 10)        { setTimeout(() => initChart(retryCount + 1), 200); return; }
   if (window._tvWidget) return; // already running
 
   container.innerHTML = '';

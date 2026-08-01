@@ -69,9 +69,10 @@ function resolveORB(sig, bars) {
 
 const BACKTESTED = {
   'ICT-leg-filter': { avgR: 0.405, n: 7, label: 'OOS backtest (thin sample)' },
-  // rangeHour=9/target=0.5x config — weighted avg across the 3 walk-forward
-  // folds that independently picked this shape (2 of 3 profitable, not all).
-  'ORB':            { avgR: 0.060, n: 217, label: 'walk-forward folds 1,2,4 combined (not all profitable)' },
+  // rangeHour=9/target=0.5x config — folds 1+2 ONLY (both profitable), by
+  // request. Fold 4 picked this same shape and went slightly negative;
+  // excluded here deliberately, not because it was overlooked.
+  'ORB':            { avgR: 0.110, n: 137, label: 'walk-forward folds 1+2 only, both profitable' },
 };
 
 (async () => {
