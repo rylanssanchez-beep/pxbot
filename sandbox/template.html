@@ -291,6 +291,28 @@
     </div>
   </div>
 
+  <div class="panel">
+    <div class="panel-head"><span class="panel-title">Strategy research status — honest, not sold</span></div>
+    <div class="panel-body">
+      <table style="margin-bottom:14px">
+        <tr><th>Approach</th><th>Sample</th><th>Method</th><th>Result</th></tr>
+        <tr><td class="bear">ICT session-sweep (4 scenarios, as specified)</td><td>110 trades / 2.3yr</td><td>walk-forward, 5 folds</td><td class="bear">-26.48R total, 43.6% win</td></tr>
+        <tr><td class="bear">Same, 1440-combo parameter sweep</td><td>train/test split</td><td>OOS validation</td><td class="bear">9 of 10 best in-sample configs failed OOS</td></tr>
+        <tr><td class="bull">Same, real 1-minute entries + leg-size filter</td><td>18 trades (7 OOS)</td><td>chronological split</td><td class="bull">+0.35R avg, held up OOS — thin sample</td></tr>
+        <tr><td class="bull">Opening Range Breakout (NY-open hour)</td><td>598 trades / 2.3yr</td><td>no tuning at all</td><td class="bull">+0.077R avg, 234W/177L</td></tr>
+        <tr><td class="bear">Same, walk-forward tuned</td><td>402 OOS trades</td><td>5-fold walk-forward</td><td class="bear">+0.025R avg (weaker than untuned)</td></tr>
+      </table>
+      <p style="font-size:12.5px;color:var(--text-dim);line-height:1.6;margin:0">
+        <b style="color:var(--text)">Read:</b> nothing tested this session is ready for funded capital. The ORB
+        result is the most credible finding — biggest sample, least tuning, survives a real ~5.6pt spread check
+        against a ~158pt average risk. It's a thin edge (+0.02–0.08R/trade), not an edge worth scaling. The ICT
+        leg-filter result is more promising per-trade but on too few trades (7–18) to trust yet. No 90%+ win rate
+        was found anywhere in the parameter space searched — the honest ceiling found so far is ~55–67% depending
+        on filter, with small average wins. All of this is reproducible in <code>backtest/</code> in the repo.
+      </p>
+    </div>
+  </div>
+
   <div class="panel ai-panel">
     <div class="panel-head ai-head">
       <span class="panel-title">AI Read — Claude</span>
