@@ -69,7 +69,9 @@ function resolveORB(sig, bars) {
 
 const BACKTESTED = {
   'ICT-leg-filter': { avgR: 0.405, n: 7, label: 'OOS backtest (thin sample)' },
-  'ORB':            { avgR: 0.077, n: 598, label: 'untuned backtest' },
+  // rangeHour=9/target=0.5x config — weighted avg across the 3 walk-forward
+  // folds that independently picked this shape (2 of 3 profitable, not all).
+  'ORB':            { avgR: 0.060, n: 217, label: 'walk-forward folds 1,2,4 combined (not all profitable)' },
 };
 
 (async () => {

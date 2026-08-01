@@ -7,7 +7,9 @@
 //   1. ICT leg-filter (Asia/London session classification + OTE entry)
 //      — real track record: +0.35R avg, 18 trades, 7 out-of-sample.
 //   2. Opening Range Breakout (NY-open-hour range breakout)
-//      — real track record: +0.077R avg, 598 trades, untuned.
+//      — using the rangeHour=9/target=0.5x config folds 1, 2, and 4 of the
+//      walk-forward independently picked (2 of those 3 folds profitable,
+//      not all — see ORB_TRACK_RECORD below for the real per-fold numbers).
 //
 // Every check appends to backtest/signal_journal.json — that journal is what
 // "self-adapting" actually means here: re-run backtest/journal_review.js
@@ -42,8 +44,19 @@ function rangeOf(bars) {
 }
 
 const ICT_TRACK_RECORD = 'leg>=199pt filter: +0.349R avg train (n=18), +0.405R avg OOS (n=7) — thin sample, not proven.';
-const ORB_TRACK_RECORD = 'default params, untuned: +0.077R avg (n=598, 2.3yr). Walk-forward: +0.025R avg (n=402 OOS, 2/5 folds profitable).';
 const ICT_MIN_LEG = 199; // the one leg-size filter that held up out-of-sample
+
+// Switched from the untuned default to the config folds 1, 2, and 4 all
+// independently picked (rangeHour=9, target=0.5x) — the one part of the ORB
+// walk-forward that showed real consistency across folds instead of a
+// different "best" every time. Stop buffer (5%) matches fold 2 exactly;
+// fold 1 used 2%, fold 4 used 10% and was the one that went slightly
+// negative. This is a chosen config from real folds, not a proven constant —
+// say so plainly rather than implying it's settled.
+const ORB_CONFIG = { ...DEFAULT_ORB, rangeHour: 9, targetMultiple: 0.5, slBufferPct: 0.05, minRangeSize: 100 };
+const ORB_TRACK_RECORD = 'rangeHour=9/target=0.5x config (folds 1,2,4 agreed on this): fold1 +0.184R/trade (n=58), '
+  + 'fold2 +0.055R/trade (n=79), fold4 -0.025R/trade (n=80) — 2 of 3 folds that picked this shape were profitable, '
+  + 'not all. Untuned default (rangeHour=8, target=1x) separately tested +0.077R avg across 598 trades, no tuning.';
 
 (async () => {
   const health = await get('/api/health');
@@ -90,26 +103,26 @@ const ICT_MIN_LEG = 199; // the one leg-size filter that held up out-of-sample
 
   // --- ORB: needs today's range-hour bar + is currently past it ---
   console.log('');
-  const rangeBar = bars.slice(-30).find(b => { const p = ctParts(b.time); return p.dateKey === dateKey && Math.floor(p.hour) === DEFAULT_ORB.rangeHour; });
+  const rangeBar = bars.slice(-30).find(b => { const p = ctParts(b.time); return p.dateKey === dateKey && Math.floor(p.hour) === ORB_CONFIG.rangeHour; });
   if (!rangeBar) {
-    console.log(`[ORB] Range-hour bar (${DEFAULT_ORB.rangeHour}:00 CT) not available yet for today.`);
+    console.log(`[ORB] Range-hour bar (${ORB_CONFIG.rangeHour}:00 CT) not available yet for today.`);
   } else {
     const size = rangeBar.high - rangeBar.low;
-    console.log(`[ORB] Opening range (${DEFAULT_ORB.rangeHour}:00-${DEFAULT_ORB.rangeHour + 1}:00 CT): ${rangeBar.low} - ${rangeBar.high} (${size.toFixed(1)}pt)`);
-    if (hour <= DEFAULT_ORB.rangeHour + 1) {
+    console.log(`[ORB] Opening range (${ORB_CONFIG.rangeHour}:00-${ORB_CONFIG.rangeHour + 1}:00 CT): ${rangeBar.low} - ${rangeBar.high} (${size.toFixed(1)}pt)`);
+    if (hour <= ORB_CONFIG.rangeHour + 1) {
       console.log('  Still inside the range hour — no breakout to check yet.');
-    } else if (size < DEFAULT_ORB.minRangeSize) {
-      console.log(`  Range too small (< ${DEFAULT_ORB.minRangeSize}pt floor) — no signal.`);
+    } else if (size < ORB_CONFIG.minRangeSize) {
+      console.log(`  Range too small (< ${ORB_CONFIG.minRangeSize}pt floor) — no signal.`);
     } else if (quote.last > rangeBar.high) {
-      const sl = rangeBar.low - size * DEFAULT_ORB.slBufferPct;
-      const target = quote.last + size * DEFAULT_ORB.targetMultiple;
+      const sl = rangeBar.low - size * ORB_CONFIG.slBufferPct;
+      const target = quote.last + size * ORB_CONFIG.targetMultiple;
       console.log(`  BREAKOUT: price ${quote.last} above range high ${rangeBar.high} -> BUY`);
       console.log(`  Stop: ${sl.toFixed(1)}  Target: ${target.toFixed(1)}`);
       console.log(`  Track record: ${ORB_TRACK_RECORD}`);
       results.signals.push({ strategy: 'ORB', bias: 'BUY', entry: quote.last, sl, target, trackRecord: ORB_TRACK_RECORD });
     } else if (quote.last < rangeBar.low) {
-      const sl = rangeBar.high + size * DEFAULT_ORB.slBufferPct;
-      const target = quote.last - size * DEFAULT_ORB.targetMultiple;
+      const sl = rangeBar.high + size * ORB_CONFIG.slBufferPct;
+      const target = quote.last - size * ORB_CONFIG.targetMultiple;
       console.log(`  BREAKOUT: price ${quote.last} below range low ${rangeBar.low} -> SELL`);
       console.log(`  Stop: ${sl.toFixed(1)}  Target: ${target.toFixed(1)}`);
       console.log(`  Track record: ${ORB_TRACK_RECORD}`);
