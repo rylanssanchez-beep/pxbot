@@ -129,11 +129,26 @@ function variantTightStopWideTarget(bias, levels, entryPrice, bars, legLow, legH
   return { r: 0, exit: 'TIMEOUT' };
 }
 
+// Isolates "let it run further" from "tighten the stop" — same original
+// stop as baseline, single exit at TP3 instead of the TP1/2/3 ladder.
+function variantWideTargetSameStop(bias, levels, entryPrice, bars) {
+  const risk = Math.abs(entryPrice - levels.sl);
+  if (risk <= 0) return null;
+  for (const b of bars) {
+    const hitSL = bias === 'BUY' ? b.low <= levels.sl : b.high >= levels.sl;
+    if (hitSL) return { r: -1, exit: 'SL' };
+    const hitTP3 = bias === 'BUY' ? b.high >= levels.tp3 : b.low <= levels.tp3;
+    if (hitTP3) return { r: Math.abs(levels.tp3 - entryPrice) / risk, exit: 'TP3' };
+  }
+  return { r: 0, exit: 'TIMEOUT' };
+}
+
 const VARIANTS = {
   baseline: variantBaseline,
   breakeven_ladder: variantBreakevenLadder,
   partial_50_50: variantPartial5050,
   tight_sl_wide_target: variantTightStopWideTarget,
+  wide_target_same_stop: variantWideTargetSameStop,
 };
 
 (async () => {
@@ -176,4 +191,45 @@ const VARIANTS = {
   }
 
   console.log('\nSample size reminder: n is in the 30s. Directionally informative, not statistically proven.');
+
+  // --- Selectivity: does filtering for bigger/cleaner legs improve quality? ---
+  console.log('\n=== SELECTIVITY: bigger legs only (fewer trades, same two best exit schemes) ===');
+  const legSizes = trades.map(t => Math.abs(t.legHigh - t.legLow)).sort((a, b) => a - b);
+  const median = legSizes[Math.floor(legSizes.length / 2)];
+  const thresholds = [0, Math.round(median * 0.75), Math.round(median), Math.round(median * 1.5), Math.round(median * 2)];
+
+  for (const minLeg of thresholds) {
+    const filtered = trades.filter(t => Math.abs(t.legHigh - t.legLow) >= minLeg);
+    for (const name of ['baseline', 'breakeven_ladder']) {
+      const fn = VARIANTS[name];
+      let totalR = 0, n = 0;
+      for (const t of filtered) {
+        const res = fn(t.bias, t.levels, t.entryPrice, t.forwardBars, t.legLow, t.legHigh);
+        if (!res) continue;
+        n++; totalR += res.r;
+      }
+      console.log(`  minLeg>=${minLeg}pt  ${name}: n=${n}  totalR=${totalR.toFixed(2)}  avgR=${n ? (totalR / n).toFixed(3) : 'n/a'}`);
+    }
+  }
+
+  // --- Out-of-sample check on the two most promising leg-size filters ---
+  // Same trap as the earlier 1440-combo sweep is possible here too: picking
+  // whichever minLeg looked best in-sample and reporting that alone. Split
+  // chronologically (first 60% / last 40%, test half never used to pick the
+  // filter) before calling anything promising.
+  console.log('\n=== OUT-OF-SAMPLE CHECK on the leg-size filter (chronological split) ===');
+  trades.sort((a, b) => a.date < b.date ? -1 : 1);
+  for (const minLeg of [150, 199]) {
+    const filtered = trades.filter(t => Math.abs(t.legHigh - t.legLow) >= minLeg);
+    const splitIdx = Math.ceil(filtered.length * 0.6);
+    const train = filtered.slice(0, splitIdx), test = filtered.slice(splitIdx);
+    const score = arr => {
+      let r = 0, n = 0;
+      for (const t of arr) { const res = VARIANTS.breakeven_ladder(t.bias, t.levels, t.entryPrice, t.forwardBars); if (!res) continue; n++; r += res.r; }
+      return { n, totalR: +r.toFixed(2), avgR: n ? +(r / n).toFixed(3) : null };
+    };
+    const trainScore = score(train), testScore = score(test);
+    console.log(`  minLeg>=${minLeg}pt: TRAIN ${JSON.stringify(trainScore)} [${train[0]?.date} -> ${train[train.length-1]?.date}]`);
+    console.log(`  minLeg>=${minLeg}pt: TEST  ${JSON.stringify(testScore)} [${test[0]?.date} -> ${test[test.length-1]?.date}] (never used to pick this filter)`);
+  }
 })().catch(e => { console.error('Failed:', e.message); process.exit(1); });

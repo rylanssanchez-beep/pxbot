@@ -17,6 +17,7 @@ const DEFAULT_THRESHOLDS = {
   oteLo:            0.618, // OTE retracement band, fraction of leg size from the leg's terminal point
   oteHi:            0.705,
   allowedDaysOfWeek: [0, 1, 2, 3, 4, 5, 6], // 0=Sun..6=Sat (CT date of the NY session) — filter for day-of-week gating
+  minLegSize:       0, // points — skip small/noisy legs entirely below this size (selectivity filter)
 };
 
 function ctParts(unixSecs) {
@@ -93,6 +94,10 @@ function classifyDay(asia, london, th = DEFAULT_THRESHOLDS) {
   if (sweptBoth) {
     return { id: 4, bias: 'AVOID', reason: 'London swept both sides of Asia — Search & Destroy' };
   }
+
+  const tooSmall = (l.high - l.low) < th.minLegSize;
+  if (tooSmall) return { id: 0, bias: 'WAIT', reason: `leg too small (< ${th.minLegSize}pt selectivity floor)` };
+
   if (asiaDir && !londonDir) {
     return { id: 1, bias: asiaBias, legLow: l.low, legHigh: l.high, reason: 'Asia directional, London consolidated' };
   }
