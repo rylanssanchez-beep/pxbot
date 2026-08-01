@@ -5,3 +5,4 @@ tl_session.json
 mcp_token.json
 sandbox_snapshot.html
 node_modules/
+backtest/results.json
