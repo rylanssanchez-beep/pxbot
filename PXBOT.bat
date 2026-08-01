@@ -6,6 +6,16 @@ echo   PXBOT NQ Console — Starting...
 echo  ================================================
 echo.
 
+:: Check Node.js is installed
+where node >nul 2>&1
+if errorlevel 1 (
+  echo  Node.js is not installed or not on PATH.
+  echo  Install it from https://nodejs.org (LTS version), then double-click this file again.
+  echo.
+  pause
+  exit /b 1
+)
+
 :: Kill any old instance on port 8899
 for /f "tokens=5" %%a in ('netstat -ano 2^>nul ^| findstr ":8899 "') do (
   taskkill /PID %%a /F >nul 2>&1
