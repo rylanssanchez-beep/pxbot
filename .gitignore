@@ -7,3 +7,4 @@ sandbox_snapshot.html
 node_modules/
 backtest/results.json
 backtest/sweep_results.json
+backtest/walkforward_results.json
