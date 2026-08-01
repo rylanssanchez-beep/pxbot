@@ -10,3 +10,4 @@ backtest/sweep_results.json
 backtest/walkforward_results.json
 backtest/deep_*.json
 backtest/finegrain_results.json
+backtest/orb_results.json
