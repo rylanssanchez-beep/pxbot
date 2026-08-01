@@ -2598,8 +2598,8 @@ function stopLivePolling() {
 }
 
 // ─── Auto-Signal Engine ───────────────────────────────────────────────────────
-// Fires Ollama automatically at each signal window entry and every 30 min
-// during active trading hours. User can always override manually.
+// Checks the validated engine automatically at start and every 5 min while
+// Trading Mode (BOT ON) is active. User can always override manually.
 let _autoSigInterval = null;
 let _lastAutoSigH    = -1;
 
@@ -2608,7 +2608,7 @@ function startAutoSignalEngine() {
   if (!state.tradingMode) { console.log('[PXBOT] Auto-signal skipped — Trading Mode is OFF'); return; }
   // Fire immediately on start (after brief delay for data to load)
   setTimeout(() => { if (state.tl?.connected && !state.day.tradeActive && state.tradingMode) runAISignal(); }, 3000);
-  // Then fire every 5 minutes continuously — Ollama is always watching the market
+  // Then fire every 5 minutes continuously
   _autoSigInterval = setInterval(async () => {
     if (!state.tl?.connected)  return;
     if (!state.tradingMode)    return;
@@ -2616,7 +2616,7 @@ function startAutoSignalEngine() {
     if (state.replay.active)   return;
     const aiOut = $('aiOutput');
     if (aiOut && !aiOut.classList.contains('has-signal')) {
-      aiOut.textContent = '🔄 Auto-scan: AI reading live structure…';
+      aiOut.textContent = '🔄 Auto-scan: checking validated signals…';
     }
     await runAISignal();
   }, 5 * 60 * 1000); // every 5 minutes
@@ -2763,41 +2763,14 @@ function updateTradeManager(cur, entry, stop, target, pnl, pnlFmt, progress, toT
   }
 }
 
-// ─── AI Signal Engine ─────────────────────────────────────────────────────────
-// Ollama IS the brain. It receives raw candle data, applies ICT itself,
-// and returns a fully structured JSON signal that drives every UI panel.
+// ─── Signal Engine ────────────────────────────────────────────────────────────
+// The validated backtested engine (server-side /api/signal) decides every
+// signal now. This file just fetches it and drives the UI panels.
 
 function setAiThinking(label) {
   $('aiThinking').style.display = label ? 'flex' : 'none';
   if (label) $('aiThinkingLabel').textContent = label;
   setBotScanning(!!label);
-}
-
-// Fetch real NQ candles for AI — always 5m resolution for ICT analysis
-// IMPORTANT: does NOT touch the chart or state.candles — AI data is separate
-// so switching the AI never disrupts what timeframe the user is viewing
-async function fetchRealNQData() {
-  const setDS = (txt, cls) => { const el = $('aiDataSource'); if (el) { el.textContent = txt; el.className = 'pill ' + cls; } };
-  try {
-    setAiThinking('Fetching NQ data from TradeLocker…');
-    const d = await proxyGet('/api/candles?resolution=5&count=300');
-    proxyOnline = true;
-    if (d.bars && d.bars.length > 20) {
-      setDS('LIVE TL DATA', 'green-pill');
-      return normalizeBars(d.bars, 'tl');
-    }
-    if (d.error) console.warn('[PXBOT] TL candles:', d.error);
-  } catch (e) {
-    proxyOnline = false;
-    console.warn('[PXBOT] AI proxy fetch:', e.message);
-  }
-  // Fall back to current state.candles (already live TL data if connected)
-  if (state.candles.length > 20 && state.tl?.connected) {
-    setDS('TL CACHED', 'yellow-pill');
-    return state.candles;
-  }
-  setDS('SIM DATA', 'yellow-pill');
-  return state.candles;
 }
 
 function normalizeBars(bars, src) {
@@ -2820,146 +2793,16 @@ function normalizeBars(bars, src) {
   }).filter(b => b.close > 0);
 }
 
-// Compress candles to a summary string Ollama can reason about efficiently
-function compressCandlesForAI(candles) {
-  // Send last 120 candles (10h at 5m) as compact CSV + session summaries
-  const recent = candles.slice(-120);
-  const csvRows = recent.map(c =>
-    `${(c.etH||0).toFixed(2)},${(c.open||0).toFixed(2)},${(c.high||0).toFixed(2)},${(c.low||0).toFixed(2)},${(c.close||0).toFixed(2)},${Math.round(c.volume||0)}`
-  ).join('\n');
-
-  const asia   = sessionRange(candles, 20, 26);
-  const london = sessionRange(candles, 2, 8);
-  const nyam   = sessionRange(candles, 8, 11);
-  const cur    = candles.at(-1)?.close || 0;
-
-  // Market structure analysis
-  const struct = detectStructure(candles);
-  const lastBos  = struct.bosPoints.slice(-3).map(b => `${b.type}@${fmtP(b.price)}`).join(', ') || 'none';
-  const lastChoch = struct.chochPoints.slice(-2).map(b => `${b.type}@${fmtP(b.price)}`).join(', ') || 'none';
-  const recentEQH = struct.eqHighs.slice(-2).map(e => fmtP(e.price)).join(', ') || 'none';
-  const recentEQL = struct.eqLows.slice(-2).map(e => fmtP(e.price)).join(', ') || 'none';
-  const structNote = `Structure bias: ${struct.structureBias} | BOS: ${lastBos} | CHOCH: ${lastChoch} | EQH: ${recentEQH} | EQL: ${recentEQL}`;
-
-  return { csvRows, asia, london, nyam, cur, structNote };
-}
-
-// ─── Deep ICT Context Engine — feeds Ollama everything it needs ──────────────
-function computeICTContext(candles) {
-  if (!candles || candles.length < 10) return { fvgs:[], orderBlocks:[], swingLevels:[], premDisc:'', multiFibs:[] };
-
-  const bars = candles;
-  const n    = bars.length;
-
-  // ── 1. Fair Value Gaps (FVG / Imbalance) ───────────────────────────────────
-  // 3-bar pattern: gap between bar[i-2].high and bar[i].low (bullish) or bar[i-2].low and bar[i].high (bearish)
-  const fvgs = [];
-  for (let i = 2; i < n; i++) {
-    const prev2 = bars[i-2], prev1 = bars[i-1], cur = bars[i];
-    // Bullish FVG: gap above bar[i-2] and below bar[i]
-    if (cur.low > prev2.high) {
-      const size = +(cur.low - prev2.high).toFixed(2);
-      if (size >= 1.5) fvgs.push({ type:'BFVG', top: cur.low, bot: prev2.high, mid: +((cur.low+prev2.high)/2).toFixed(2), size, idx:i, etH: prev1.etH||0 });
-    }
-    // Bearish FVG: gap below bar[i-2] and above bar[i]
-    if (cur.high < prev2.low) {
-      const size = +(prev2.low - cur.high).toFixed(2);
-      if (size >= 1.5) fvgs.push({ type:'BSFVG', top: prev2.low, bot: cur.high, mid: +((prev2.low+cur.high)/2).toFixed(2), size, idx:i, etH: prev1.etH||0 });
-    }
-  }
-
-  // ── 2. Order Blocks ─────────────────────────────────────────────────────────
-  // Bullish OB: last bearish (red) candle BEFORE a strong bullish displacement move
-  // Bearish OB: last bullish (green) candle BEFORE a strong bearish displacement move
-  const orderBlocks = [];
-  const DISPLACE_THRESH = 8; // minimum body size in points to qualify as displacement
-  for (let i = 3; i < n - 1; i++) {
-    const c   = bars[i];
-    const nxt = bars[i+1];
-    const bodyNext = Math.abs(nxt.close - nxt.open);
-    if (bodyNext < DISPLACE_THRESH) continue;
-    // Bullish OB: red candle before large green displacement
-    if (c.close < c.open && nxt.close > nxt.open && bodyNext >= DISPLACE_THRESH) {
-      orderBlocks.push({ type:'BOB', top: c.open, bot: c.close, mid: +((c.open+c.close)/2).toFixed(2), idx:i, etH: c.etH||0 });
-    }
-    // Bearish OB: green candle before large red displacement
-    if (c.close > c.open && nxt.close < nxt.open && bodyNext >= DISPLACE_THRESH) {
-      orderBlocks.push({ type:'BEOB', top: c.close, bot: c.open, mid: +((c.close+c.open)/2).toFixed(2), idx:i, etH: c.etH||0 });
-    }
-  }
-
-  // ── 3. Multi-Swing Fibonacci Levels ────────────────────────────────────────
-  // Find all major swing highs and lows (3-bar rule), then fib the top-3 most significant legs
-  const swingHighs = [], swingLows = [];
-  for (let i = 1; i < n - 1; i++) {
-    if (bars[i].high > bars[i-1].high && bars[i].high > bars[i+1].high)
-      swingHighs.push({ price: bars[i].high, idx: i, etH: bars[i].etH||0 });
-    if (bars[i].low < bars[i-1].low && bars[i].low < bars[i+1].low)
-      swingLows.push({ price: bars[i].low, idx: i, etH: bars[i].etH||0 });
-  }
-
-  // Build significant legs: every swingHigh/swingLow pair that has size >= 20pts
-  const multiFibs = [];
-  const recentHighs = swingHighs.slice(-8);
-  const recentLows  = swingLows.slice(-8);
-  recentHighs.forEach(sh => {
-    recentLows.forEach(sl => {
-      const legSize = Math.abs(sh.price - sl.price);
-      if (legSize < 20) return;
-      const bias    = sl.idx > sh.idx ? 'BUY' : 'SELL';
-      const legHigh = sh.price, legLow = sl.price;
-      const ote618  = +(legHigh - (legHigh - legLow) * (bias === 'BUY' ? 0.618 : 0.382)).toFixed(2);
-      const ote705  = +(legHigh - (legHigh - legLow) * (bias === 'BUY' ? 0.705 : 0.295)).toFixed(2);
-      const tp1_ext = +(bias === 'BUY' ? legLow + (legHigh - legLow) * 0.5 : legHigh - (legHigh - legLow) * 0.5).toFixed(2);
-      const tp2_ext = +(bias === 'BUY' ? legHigh : legLow).toFixed(2);
-      const tp3_ext = +(bias === 'BUY' ? legLow + (legHigh - legLow) * 1.272 : legHigh - (legHigh - legLow) * 1.272).toFixed(2);
-      multiFibs.push({ bias, legHigh, legLow, legSize: +legSize.toFixed(2), ote618, ote705, tp1: tp1_ext, tp2: tp2_ext, tp3: tp3_ext, shIdx: sh.idx, slIdx: sl.idx });
-    });
-  });
-  // Sort by leg size descending, keep top 3
-  multiFibs.sort((a,b) => b.legSize - a.legSize);
-  multiFibs.splice(3);
-
-  // ── 4. Premium / Discount Zone ─────────────────────────────────────────────
-  const hiAll = Math.max(...bars.slice(-48).map(b => b.high));
-  const loAll = Math.min(...bars.slice(-48).map(b => b.low));
-  const mid50 = +(( hiAll + loAll ) / 2).toFixed(2);
-  const curP  = bars.at(-1)?.close || 0;
-  const premDisc = curP > mid50
-    ? `PREMIUM (price ${fmtP(curP)} is ABOVE 50% equilibrium ${fmtP(mid50)} — ideal SELL area, avoid buying here)`
-    : `DISCOUNT (price ${fmtP(curP)} is BELOW 50% equilibrium ${fmtP(mid50)} — ideal BUY area, avoid selling here)`;
-
-  // ── 5. Swing levels as a clean list for the prompt ─────────────────────────
-  const swingLevels = [
-    ...swingHighs.slice(-5).map(s => ({ type:'SH', price: s.price, etH: s.etH })),
-    ...swingLows.slice(-5).map(s  => ({ type:'SL', price: s.price, etH: s.etH })),
-  ].sort((a,b) => b.price - a.price);
-
-  return { fvgs: fvgs.slice(-6), orderBlocks: orderBlocks.slice(-4), swingLevels, premDisc, multiFibs };
-}
-
-// Parse Ollama's JSON response with retry on malformed output
-async function ollamaGenerate(prompt, model, attempt = 1) {
-  const res = await fetch('http://localhost:11434/api/generate', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model, prompt, stream: false }),
-  });
-  if (!res.ok) throw new Error(`Ollama HTTP ${res.status}`);
-  const data = await res.json();
-  return data.response || data.message?.content || '';
-}
-
-function extractJSON(text) {
-  // Pull the first {...} block out of Ollama's response even if it adds prose around it
-  const match = text.match(/\{[\s\S]*\}/);
-  if (!match) return null;
-  try { return JSON.parse(match[0]); } catch (_) { return null; }
-}
-
 // Quick bias button — runs the full AI signal (alias so both buttons work)
 async function getAiBias() { return runAISignal(); }
 
+// ─── Validated Signal Engine ────────────────────────────────────────────────
+// Replaced the Ollama-decides-everything pipeline. The deterministic engine
+// backtested this session (backtest/ict_engine.js + orb_engine.js, exposed
+// live via /api/signal) is now the actual decision-maker — not a small local
+// LLM guessing at numbers from a text prompt. Neither approach is proven at
+// scale; every result below says so plainly rather than presenting a
+// confidence score this system hasn't earned.
 async function runAISignal() {
   // ── Pre-flight checks ───────────────────────────────────────────────────────
   const check = canTakeSignal();
@@ -2969,406 +2812,85 @@ async function runAISignal() {
     return;
   }
 
-  const btn   = $('runAiSignal');
-  const out   = $('aiOutput');
-  const model = $('ollamaModel').value;
-  const minConf   = Number($('minConf').value)   || 75;
-  const minRR     = Number($('minRR').value)      || 2.5;
-  const minTarget = Number($('minTarget').value)  || 60;
+  const btn = $('runAiSignal');
+  const out = $('aiOutput');
 
   btn.classList.add('running');
-  btn.textContent = '⏳ AI Thinking…';
+  btn.textContent = '⏳ Checking validated signals…';
   btn.disabled    = true;
   $('aiConfidence').style.display = 'none';
   out.classList.remove('has-signal');
   out.textContent = '';
 
   try {
-    // Step 1: fetch data + market context in parallel
-    const [candles, mktCtx, tvCtx] = await Promise.all([
-      fetchRealNQData(),
-      proxyGet('/api/context').catch(() => null),
-      proxyGet('/api/tvcontext').catch(() => null),
-    ]);
-    if (candles && candles.length) { state.candles = candles; state.scenarioId = 0; }
+    const sig = await proxyGet('/api/signal');
+    if (sig.error) throw new Error(sig.error);
 
-    // Step 2: build context
-    setAiThinking('AI is analyzing ICT structure…');
-    const { csvRows, asia, london, nyam, cur, structNote } = compressCandlesForAI(state.candles);
-    const ictCtx = computeICTContext(state.candles);
+    const dsEl = $('aiDataSource');
+    if (dsEl) { dsEl.textContent = 'LIVE TL DATA'; dsEl.className = 'pill green-pill'; }
 
-    // Format ICT context for prompt
-    const fvgNote = ictCtx.fvgs.length
-      ? ictCtx.fvgs.map(f => `${f.type} at ${fmtP(f.bot)}–${fmtP(f.top)} (mid ${fmtP(f.mid)}, size ${f.size}pts, CT=${f.etH.toFixed(1)}h)`).join(' | ')
-      : 'none detected';
-    const obNote = ictCtx.orderBlocks.length
-      ? ictCtx.orderBlocks.map(o => `${o.type} zone ${fmtP(o.bot)}–${fmtP(o.top)} (mid ${fmtP(o.mid)}, CT=${o.etH.toFixed(1)}h)`).join(' | ')
-      : 'none detected';
-    const swingNote = ictCtx.swingLevels.map(s => `${s.type}@${fmtP(s.price)}`).join(' ');
-    const multiFibNote = ictCtx.multiFibs.length
-      ? ictCtx.multiFibs.map((f,i) => `Leg${i+1}(${f.bias}) ${fmtP(f.legLow)}→${fmtP(f.legHigh)} size=${f.legSize}pts OTE=${fmtP(Math.min(f.ote618,f.ote705))}–${fmtP(Math.max(f.ote618,f.ote705))} TP1=${fmtP(f.tp1)} TP2=${fmtP(f.tp2)} TP3=${fmtP(f.tp3)}`).join('\n')
-      : 'none';
+    const ict = sig.ict, orb = sig.orb;
+    const ictFired = ict && ict.bias !== 'WAIT';
+    const orbFired = orb && orb.bias !== 'WAIT';
 
-    // ── THE PROMPT — focused on pre-market and NY open windows only ──────────
-    const ctNowDt = new Date(new Date().toLocaleString('en-US',{timeZone:'America/Chicago'}));
-    const etH     = ctNowDt.getHours() + ctNowDt.getMinutes()/60;
-    const windowNote = etH >= 8.5 && etH < 9.5
-      ? '🔥 NY OPEN KILL ZONE LIVE (8:30–9:30 AM CT). PRIMARY WINDOW. Price is sweeping now — look for the OTE pull.'
-      : etH >= 6.0 && etH < 8.5
-      ? '🟡 PRE-MARKET WINDOW LIVE (6:00–8:30 AM CT). Entry valid if manipulation leg and OTE are crystal clear before the open.'
-      : etH >= 0.0 && etH < 1.0
-      ? '🌙 PRE-LONDON SIGNAL WINDOW LIVE (Midnight–1 AM CT). London opens in under 1 hour. Build bias. Watch for stop hunt on Asia H/L at the open.'
-      : etH >= 18.0 && etH < 19.0
-      ? '🌅 PRE-ASIA SIGNAL WINDOW LIVE (6–7 PM CT). Asia opens in 1 hour. Identify daily top/bottom and set your overnight bias.'
-      : etH >= 1.0 && etH < 6.0
-      ? 'London session running (1–7 AM CT). Manipulation phase. Watch for sweep of Asia H/L. Pre-Market window opens at 6:00 AM CT.'
-      : etH >= 9.5 && etH < 15.0
-      ? 'NY session running. Kill zone has closed. DO NOT take new entries after 9:30 AM CT unless a pre-market signal is still active.'
-      : 'Outside all signal windows. Next signal window: Pre-Asia at 6:00 PM CT, Pre-London at Midnight CT, Pre-Market at 6:00 AM CT, NY Open at 8:30 AM CT.';
-
-    // ── Pull signal feedback history for AI self-improvement ─────────────────
-    const feedbackDb  = JSON.parse(localStorage.getItem('px_signal_feedback') || '[]');
-    const recentFb    = feedbackDb.slice(0, 10);
-    const fbNote = recentFb.length
-      ? '═══ PAST SIGNAL OUTCOMES (learn from these) ═══\n' + recentFb.map(f =>
-          `${f.date} S${f.scenario} ${f.bias} conf=${f.confidence||'?'}% → ${f.result.toUpperCase()} (entry ${fmtP(f.entry)}, R:R ${f.rr}R)`
-        ).join('\n') + '\n'
-      : '';
-
-    // ── Build manipulation leg context for the AI ────────────────────────────
-    const det0      = detectScenario(state.candles);
-    const manip     = det0.manip;
-    const manipNote = manip
-      ? `DETECTED MANIPULATION LEG: London swept Asia ${manip.bias === 'BUY' ? 'LOW' : 'HIGH'} — sweep point ${fmtP(manip.sweepPt)}. Fib anchor: LOW ${fmtP(manip.legLow)} → HIGH ${fmtP(manip.legHigh)}. Expected direction after sweep: ${manip.bias}. Liquidity target: ${fmtP(manip.target)}.`
-      : 'No clean single-sided manipulation detected yet — you must identify the manipulation leg from the candle data yourself.';
-
-    // ── Market context from server ────────────────────────────────────────────
-    const mktNote = mktCtx ? `
-═══════════════════════════════════════════
-LIVE MARKET CONTEXT (server-computed)
-═══════════════════════════════════════════
-Current time:      ${mktCtx.currentTime}
-Active session:    ${mktCtx.activeSess}
-Session quality:   ${mktCtx.sessionQuality} ${mktCtx.tradeableNow ? '✅ TRADEABLE NOW' : '⚠️ LOW-QUALITY WINDOW'}
-Day of week:       ${mktCtx.dayOfWeek?.day} — ${mktCtx.dayOfWeek?.tendency}
-Monthly profile:   ${mktCtx.monthlyBias}
-Quarterly:         ${mktCtx.quarterTendency}
-Weekly bias:       ${mktCtx.adaptiveStats?.weeklyBias || 'insufficient data (accumulating)'}
-Daily open:        ${mktCtx.adaptiveStats?.dailyOpen ? fmtP(mktCtx.adaptiveStats.dailyOpen) : 'accumulating'}
-Today\'s range:    ${mktCtx.adaptiveStats?.dailyRange ? mktCtx.adaptiveStats.dailyRange + 'pts so far' : 'accumulating'}
-ATR 5m (14):       ${mktCtx.adaptiveStats?.atr5m ? mktCtx.adaptiveStats.atr5m + 'pts' : 'accumulating'}
-ATR 1H (14):       ${mktCtx.adaptiveStats?.atr1H ? mktCtx.adaptiveStats.atr1H + 'pts' : 'accumulating'}
-Tick bars built:   1m:${mktCtx.tickBarCounts?.['1m']} | 5m:${mktCtx.tickBarCounts?.['5m']} | 1H:${mktCtx.tickBarCounts?.['1H']} | 1D:${mktCtx.tickBarCounts?.['1D']}
-
-NQ BEHAVIORAL RULES (hardcoded from 10 years of NQ price action):
-${(mktCtx.keyRules || []).map((r,i) => `${i+1}. ${r}`).join('\n')}
-` : '';
-
-    // ── TV Historical structure — full 3-month NDX dataset ──────────────────
-    const tvNote = (tvCtx && tvCtx.bars5m_total > 0) ? (() => {
-      const daily    = tvCtx.dailyBars || [];
-      const swings   = tvCtx.keySwings || [];
-      const eq       = tvCtx.eqLevels  || [];
-      const weekly   = tvCtx.weeklyProfile || [];
-      const basis    = 150; // NDX→NQ adjustment estimate
-      const nqNow    = state.candles?.at(-1)?.close || 0;
-      const ndxLast  = tvCtx.lastClose || 0;
-      const realBasis= ndxNow > 0 && nqNow > 0 ? (ndxLast - nqNow).toFixed(0) : basis;
-
-      const dailyLines = daily.slice(-15).map(b=>
-        `  ${new Date(b.time*1000).toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric'})} ` +
-        `O=${b.open.toFixed(0)} H=${b.high.toFixed(0)} L=${b.low.toFixed(0)} C=${b.close.toFixed(0)} Rng=${(b.high-b.low).toFixed(0)}pts ` +
-        `${b.close>b.open?'▲BULL':'▼BEAR'}`
-      ).join('\n');
-
-      const weekLines = weekly.slice(-6).map(w=>
-        `  Wk ${w.weekStart}: O=${w.open} H=${w.high} L=${w.low} C=${w.close} Rng=${w.range}pts ${w.bias}`
-      ).join('\n');
-
-      const swingLines = swings.slice(-15).map(s=>
-        `  ${s.type} ${s.date}: NDX=${s.price.toFixed(0)} → NQ≈${(s.price-basis).toFixed(0)}`
-      ).join('\n');
-
-      const eqLines = eq.slice(-10).map(e=>
-        `  ${e.type} NDX=${e.price.toFixed(0)} → NQ≈${(e.price-basis).toFixed(0)} (${e.dates?.join(' & ')})`
-      ).join('\n');
-
-      return `
-═══════════════════════════════════════════
-FULL HISTORICAL CONTEXT: ${tvCtx.bars5m_total} 5m bars | ${tvCtx.bars1H_total} 1H bars | ${tvCtx.bars1D_total} daily bars
-DATE RANGE: ${tvCtx.dateRange}  |  ATR(14d): ${tvCtx.atr14d}pts
-NQ basis (NDX minus NQ): ~${realBasis}pts. Subtract from every NDX price shown below.
-NDX last close: ${ndxLast} → NQ equivalent: ~${(ndxLast - basis).toFixed(0)}
-═══════════════════════════════════════════
-LAST 15 DAILY BARS (NDX — subtract ~${basis} for NQ):
-${dailyLines}
-
-LAST 6 WEEKS (bias + range):
-${weekLines}
-
-KEY DAILY SWING LEVELS (ICT external liquidity):
-${swingLines}
-
-EQUAL HIGH/LOW CLUSTERS (liquidity pools to target):
-${eqLines || '  None detected in current dataset'}
-═══════════════════════════════════════════`;
-    })() : '';
-
-    const prompt = `${fbNote}You are PXBOT — an elite AI NQ futures trader fused with ICT (Inner Circle Trader) Smart Money Concepts. You ARE the chart. You see everything: every manipulation, every liquidity pool, every fair value gap, every order block. You have absorbed 10 years of NQ price action and you adapt to what the market is doing RIGHT NOW. You only fire A+ signals. You are the brain, soul, and strategy engine of this trading system.
-${mktNote}${tvNote}
-═══════════════════════════════════════════
-THE 4 SCENARIOS — YOUR ONLY PLAYBOOK
-═══════════════════════════════════════════
-S1 — NY CONTINUATION:
-  Asia DIRECTIONAL. London CONSOLIDATES. NY sweeps London extreme → continues Asia direction.
-  Fib: from London range low to London range high. OTE 0.618–0.705 retracement = entry.
-
-S2 — NY CONSOLIDATION (London Follow-Through):
-  Asia RANGES. London makes a directional move that swept ONE side of Asia (stop hunt), then continued. NY continues London's direction.
-  Fib: from the Asia sweep point to the London close extreme. OTE = pullback to 0.618–0.705.
-
-S3 — NY REVERSAL:
-  Asia RANGES. London moved WITHOUT sweeping Asia (fake-out). NY reverses London's entire move.
-  Fib: the full London leg. Entry = OTE after NY sweeps the London extreme. Pre-market entry valid if reversal already in progress.
-
-S4 — SEARCH AND DESTROY:
-  London swept BOTH sides of Asia = broadening/expansion. NY will do the same. NO TRADE. Return WAIT.
-
-═══════════════════════════════════════════
-FIB ENGINE — YOUR MOST IMPORTANT TOOL
-═══════════════════════════════════════════
-RULE 1: ALWAYS fib the manipulation leg — the liquidity sweep move. Never fib the whole session.
-RULE 2: For BUY — fib from SWEEP LOW (0%) up to OPPOSITE HIGH (100%). OTE = 0.618–0.705 from the top = your BUY zone.
-RULE 3: For SELL — fib from SWEEP HIGH (0%) down to OPPOSITE LOW (100%). OTE = 0.618–0.705 from the bottom = your SELL zone.
-RULE 4: TP1 = 50% of leg to target (take partials, move stop to BE). TP2 = main liquidity pool (Asia H or L opposite). TP3 = 1.272 extension of the manipulation leg.
-RULE 5: Stop = 8–12 points BEYOND the sweep point (low-side for BUY, high-side for SELL).
-RULE 6: Choose the fib leg from MULTI-FIB ANALYSIS below. Compare all detected legs. The best leg is the one where:
-  a) The sweep swept a key liquidity pool (Asia H/L, EQH/EQL, prior day H/L)
-  b) Price is currently approaching the OTE zone (not already blown through it)
-  c) There is an Order Block or FVG inside the OTE zone = A+ confluence
-  d) Structure (BOS/CHOCH) confirms the direction
-
-${manipNote}
-
-═══════════════════════════════════════════
-MULTI-FIB SWING ANALYSIS (auto-detected)
-═══════════════════════════════════════════
-${multiFibNote}
-
-═══════════════════════════════════════════
-FAIR VALUE GAPS (FVG / IMBALANCE)
-═══════════════════════════════════════════
-${fvgNote}
-NOTE: Price always comes back to fill FVGs. A Bullish FVG (BFVG) in the OTE zone = strong BUY confluence. A Bearish FVG (BSFVG) in the OTE zone = strong SELL confluence.
-
-═══════════════════════════════════════════
-ORDER BLOCKS (OB)
-═══════════════════════════════════════════
-${obNote}
-NOTE: Bullish OB (BOB) is the last red candle before a big up move = demand zone. Bearish OB (BEOB) is the last green candle before a big down move = supply zone. When the OTE zone overlaps with an OB = highest probability entry.
-
-═══════════════════════════════════════════
-PREMIUM / DISCOUNT ANALYSIS
-═══════════════════════════════════════════
-${ictCtx.premDisc}
-RULE: Only BUY in discount (below 50% equilibrium). Only SELL in premium (above 50% equilibrium). Do not fight this rule.
-
-═══════════════════════════════════════════
-KEY SWING LEVELS
-═══════════════════════════════════════════
-${swingNote}
-
-═══════════════════════════════════════════
-SESSION DATA
-═══════════════════════════════════════════
-Asia   (7pm–1am CT):   H=${fmtP(asia.high)}  L=${fmtP(asia.low)}  Range=${fmtP(asia.range)}pts  Open=${fmtP(asia.open)}  Close=${fmtP(asia.close)}
-London (1am–7am CT):   H=${fmtP(london.high)}  L=${fmtP(london.low)}  Range=${fmtP(london.range)}pts  Open=${fmtP(london.open)}  Close=${fmtP(london.close)}
-NY AM  (8:30am–now CT): H=${fmtP(nyam.high||0)}  L=${fmtP(nyam.low||0)}  Current=${fmtP(cur)}
-Current CT window: ${windowNote}
-Market Structure: ${structNote}
-
-═══════════════════════════════════════════
-5-MINUTE CANDLE DATA — last 120 bars
-Format: CT_hour, open, high, low, close, volume
-═══════════════════════════════════════════
-${csvRows}
-
-═══════════════════════════════════════════
-STRUCTURE CONCEPTS (use from Market Structure above)
-═══════════════════════════════════════════
-BOS  = Break of Structure → confirms trend direction.
-CHOCH = Change of Character → first BOS opposite direction → early reversal warning.
-MSS  = strong CHOCH confirmed by close = high-conviction reversal.
-EQH  = Equal Highs → double-top liquidity pool → SELLERS sitting above → ideal SELL after sweep.
-EQL  = Equal Lows  → double-bottom liquidity pool → BUYERS sitting below → ideal BUY after sweep.
-A CHOCH confirming expected direction = +10 confidence. EQH/EQL near sweep = A+ confluence.
-
-═══════════════════════════════════════════
-SIGNAL WINDOWS — CHICAGO TIME (CT)
-═══════════════════════════════════════════
-WINDOW 1 PRE-ASIA 6–7 PM CT: Set overnight bias. Identify daily top/bottom. Look for daily H/L stop hunts.
-WINDOW 2 PRE-LONDON Midnight–1 AM CT: London opens in 1hr. Watch for Asia H/L sweep at the open.
-WINDOW 3 PRE-MARKET 6–8:30 AM CT: NQ live. Pre-market entry valid if OTE is within reach.
-WINDOW 4 NY OPEN KILL ZONE 8:30–9:30 AM CT: PRIMARY entry. NY sweeps then pulls to OTE. Pull trigger here.
-RULE: After 9:30 AM CT do NOT enter new trades unless a pre-market signal is still open.
-
-═══════════════════════════════════════════
-QUALITY GATES — RETURN WAIT IF ANY FAIL
-═══════════════════════════════════════════
-1. Confidence < ${minConf}% → WAIT
-2. R:R < ${minRR} → WAIT
-3. Target < ${minTarget}pts → WAIT
-4. Scenario 4 → always WAIT
-5. No clear manipulation leg → WAIT
-6. OTE already blown through and price far away → WAIT
-7. Choppy overlapping candles, no clean structure → WAIT
-8. Price in PREMIUM but signal is BUY → WAIT (or vice versa) unless very strong confluence
-9. FVG/OB analysis contradicts direction → lower confidence or WAIT
-
-═══════════════════════════════════════════
-HOLD TIME & EXIT
-═══════════════════════════════════════════
-Analyze: distance to target, session momentum, kill zone vs pre-market. Typical NQ: 30–60pts in 30–90min during kill zones.
-Hard exit rule: always out by 10:30 AM CT for kill zone trades (11 AM CT absolute max).
-
-═══════════════════════════════════════════
-YOUR SELF-IMPROVEMENT LOOP
-═══════════════════════════════════════════
-Study your past outcomes above. If a pattern of wins or losses exists, adapt:
-- If BUY signals keep losing → check if you are buying in premium / ignoring bearish FVGs
-- If SELL signals keep losing → check if you are selling in discount / ignoring bullish FVGs
-- High-confidence calls that lost → tighten your entry criteria next time
-- Low-confidence calls that won → identify what you missed and add it as a signal booster
-
-Return ONLY valid JSON. No markdown, no prose, nothing outside the JSON object:
-{
-  "scenario": <1|2|3|4>,
-  "scenario_name": "<NY Continuation|NY Consolidation|NY Reversal|Search & Destroy>",
-  "bias": "<BUY|SELL|WAIT>",
-  "entry_window": "<preasia|prelondon|premarket|nyopen|wait>",
-  "entry_window_note": "<one precise sentence: what to watch for and exactly when to pull the trigger in CT>",
-  "wait_reason": "<if WAIT, exactly why — else null>",
-  "asia_character": "<directional_up|directional_down|ranging>",
-  "london_direction": "<up|down|ranging>",
-  "london_swept_asia_low": <true|false>,
-  "london_swept_asia_high": <true|false>,
-  "london_swept_both": <true|false>,
-  "manipulation_leg_description": "<one sentence: exact sweep described with prices>",
-  "fib_swing_high": <price — top of the best manipulation leg>,
-  "fib_swing_low": <price — bottom of the best manipulation leg>,
-  "fib_leg_rationale": "<one sentence: why this leg was chosen over others>",
-  "ote_entry_low": <price — 0.705 fib>,
-  "ote_entry_high": <price — 0.618 fib>,
-  "order_block_in_ote": <true|false — is there an OB inside the OTE zone?>,
-  "fvg_in_ote": <true|false — is there an FVG inside the OTE zone?>,
-  "premium_discount_aligned": <true|false — does premium/discount agree with the bias?>,
-  "stop": <price — beyond the sweep point>,
-  "tp1": <price — 50% of leg, take partials>,
-  "tp1_pts": <points from OTE mid to TP1>,
-  "tp2": <price — main liquidity target>,
-  "tp2_pts": <points from OTE mid to TP2>,
-  "tp3": <price — 1.272 extension of manipulation leg>,
-  "tp3_pts": <points from OTE mid to TP3>,
-  "target": <price — same as tp2>,
-  "stop_pts": <points from OTE mid to stop>,
-  "target_pts": <points from OTE mid to tp2>,
-  "rr": <tp2_pts / stop_pts rounded to 1 decimal>,
-  "confidence": <integer 0–100>,
-  "confluence_score": "<list of confluence factors present, e.g. OB+FVG+EQL+CHOCH+Discount>",
-  "key_sweep_level": <price of the manipulation sweep point>,
-  "hold_time_min_minutes": <integer — based on: nyOpen=20-45min, premarket=30-60min, london=45-90min, asia=60-120min, nyPm=20-40min>,
-  "hold_time_max_minutes": <integer — hard cap based on session: nyOpen max 60min, premarket max 90min, london max 120min, asia max 180min>,
-  "hard_time_exit": "<exact CT time to be OUT regardless — e.g. '9:30 AM CT' for nyOpen trades, '7:00 AM CT' for london trades, '1:00 AM CT' for pre-london trades>",
-  "scale_account_note": "<one sentence: is this signal quality suitable for adding size? e.g. 'A+ confluence — suitable for full size' or 'B setup — 50% size only' or 'Wait for B+ before scaling'>",
-  "reentry_condition": "<one sentence: exact condition that allows a re-entry after first exit — e.g. 'Re-enter only if price returns to OTE zone at 27,850-27,870 and forms a bullish OB confirmation on 1m'>",
-  "pre_entry_invalidation": <price — if price reaches here before entry, skip>,
-  "day_of_week_note": "<one sentence: how today's DOW tendency affects this signal — e.g. Tuesday = high conviction, Thursday = reduce size>",
-  "session_quality_note": "<one sentence: is the current session high/medium/low quality for this type of setup>",
-  "reasoning": "<6 sentences: 1) Asia character with prices, 2) London action and sweep, 3) correct scenario and why, 4) FVG/OB/premium-discount confluence, 5) DOW/session quality impact on confidence, 6) exact risk management instruction for scaling this account>",
-  "invalidation": <price — your stop>
-}`;
-
-    setAiThinking('AI is building the signal…');
-    let raw  = await ollamaGenerate(prompt, model);
-    let json = extractJSON(raw);
-
-    // Retry if malformed
-    if (!json) {
-      setAiThinking('Correcting JSON format…');
-      raw  = await ollamaGenerate(`Return ONLY the JSON object from your previous response, no other text:\n${raw.slice(0, 600)}`, model);
-      json = extractJSON(raw);
-    }
-    if (!json) throw new Error('Could not parse Ollama response after 2 attempts. Try llama3 or a larger model.');
-
-    // ── Quality gate — enforce minimum standards even if AI was sloppy ─────────
-    const confidence = Math.max(0, Math.min(100, Number(json.confidence) || 0));
-    const rr         = Number(json.rr)         || 0;
-    const targetPts  = Number(json.target_pts) || 0;
-    json.confidence  = confidence;
-    json.rr          = rr;
-    json.target_pts  = targetPts;
-
-    const hardFails = [];
-    if (json.bias !== 'WAIT') {
-      if (confidence < minConf)   hardFails.push(`AI confidence ${confidence}% is below your ${minConf}% minimum`);
-      if (rr         < minRR)     hardFails.push(`R:R ${rr}R is below your ${minRR}R minimum`);
-      if (targetPts  < minTarget) hardFails.push(`Target ${targetPts}pts is below your ${minTarget}pt minimum`);
-    }
-
-    if (hardFails.length) {
-      // Override to WAIT — not good enough
-      json.bias      = 'WAIT';
-      json.wait_reason = 'Signal rejected by quality gates: ' + hardFails.join('; ');
-      out.textContent = '⛔ SIGNAL REJECTED — not A+\n\n' + hardFails.join('\n') +
-        '\n\nAI reasoning:\n' + (json.reasoning || '') +
-        '\n\nRaise your target, wait for a better day, or try again at the next session.';
-      out.classList.remove('has-signal');
-
-      // Show confidence bar in red
-      $('aiConfidence').style.display = 'flex';
-      $('confFill').style.width = confidence + '%';
-      $('confFill').style.background = 'var(--red)';
-      $('confPct').textContent = confidence + '%';
-
-      $('aiPill').textContent = 'AI: WAIT'; $('aiPill').className = 'pill yellow-pill';
+    let json;
+    if (ictFired) {
+      const lv = ict.levels;
+      const entryMid = (lv.oteLow + lv.oteHigh) / 2;
+      const risk = Math.abs(entryMid - lv.sl);
+      json = {
+        scenario: ict.scenario, scenario_name: (SCENARIOS[ict.scenario]?.name || ('S' + ict.scenario)) + ' (validated engine)',
+        bias: ict.bias, wait_reason: null,
+        entry_window: 'nyopen', entry_window_note: 'ICT leg-filter (leg≥199pt) — enter on the OTE pullback.',
+        ote_entry_low: lv.oteLow, ote_entry_high: lv.oteHigh,
+        stop: lv.sl, target: lv.tp2, stop_pts: +risk.toFixed(2), target_pts: +Math.abs(lv.tp2 - entryMid).toFixed(2),
+        tp1: lv.tp1, tp2: lv.tp2, tp3: lv.tp3,
+        tp1_pts: +Math.abs(lv.tp1 - entryMid).toFixed(2), tp2_pts: +Math.abs(lv.tp2 - entryMid).toFixed(2), tp3_pts: +Math.abs(lv.tp3 - entryMid).toFixed(2),
+        rr: +(Math.abs(lv.tp2 - entryMid) / Math.max(0.25, risk)).toFixed(1),
+        confidence: null,
+        reasoning: `Validated ICT leg-filter engine: ${ict.reason}. Track record: ${ict.trackRecord}` + (orbFired ? ` [ORB also fired this bar — see below]` : ''),
+        invalidation: lv.sl,
+      };
+    } else if (orbFired) {
+      const risk = Math.abs(orb.entry - orb.sl);
+      json = {
+        scenario: 0, scenario_name: 'Opening Range Breakout (validated engine)',
+        bias: orb.bias, wait_reason: null,
+        entry_window: 'nyopen', entry_window_note: 'ORB breakout of the 9–10 AM CT range — already triggered, this is a market entry.',
+        ote_entry_low: orb.entry, ote_entry_high: orb.entry,
+        stop: orb.sl, target: orb.target, stop_pts: +risk.toFixed(2), target_pts: +Math.abs(orb.target - orb.entry).toFixed(2),
+        tp1: 0, tp2: orb.target, tp3: 0,
+        tp1_pts: 0, tp2_pts: +Math.abs(orb.target - orb.entry).toFixed(2), tp3_pts: 0,
+        rr: +(Math.abs(orb.target - orb.entry) / Math.max(0.25, risk)).toFixed(1),
+        confidence: null,
+        reasoning: `Validated ORB engine: breakout of the opening range. Track record: ${orb.trackRecord}`,
+        invalidation: orb.sl,
+      };
     } else {
-      // ── Apply valid signal ───────────────────────────────────────────────────
-      applyAISignal(json);
-
-      const waitReason = json.bias === 'WAIT' ? (json.wait_reason || 'No valid setup today.') : null;
-      out.classList.toggle('has-signal', json.bias !== 'WAIT');
-      const extraLines = json.bias !== 'WAIT' ? [
-        json.scale_account_note   ? `\nScale: ${json.scale_account_note}`           : '',
-        json.reentry_condition    ? `\nRe-entry: ${json.reentry_condition}`          : '',
-        json.day_of_week_note     ? `\nDOW: ${json.day_of_week_note}`               : '',
-        json.session_quality_note ? `\nSession: ${json.session_quality_note}`        : '',
-      ].join('') : '';
-      out.textContent = json.bias === 'WAIT'
-        ? '⏸ AI WAIT\n\n' + waitReason + '\n\nReasoning:\n' + (json.reasoning || '')
-        : `✅ A+ SIGNAL — ${json.bias} NQ\n\nReasoning:\n${json.reasoning || ''}${extraLines}\n\nInvalidation: ${json.invalidation || ''}`;
-
-      // Confidence bar
-      $('aiConfidence').style.display = 'flex';
-      $('confFill').style.width = confidence + '%';
-      $('confFill').style.background = confidence >= 75
-        ? 'linear-gradient(90deg,var(--green),var(--cyan))'
-        : confidence >= 60 ? 'linear-gradient(90deg,var(--yellow),var(--green))' : 'var(--red)';
-      $('confPct').textContent = confidence + '%';
-
-      $('aiPill').textContent = json.bias === 'WAIT' ? 'AI: WAIT' : 'AI: LIVE ✦';
-      $('aiPill').className   = json.bias === 'WAIT' ? 'pill yellow-pill' : 'pill cyan-pill';
+      json = {
+        scenario: 0, scenario_name: 'No signal', bias: 'WAIT',
+        wait_reason: `ICT: ${ict ? ict.reason : 'not enough Asia/London data yet today'}. ORB: ${orb ? orb.reason : 'range hour not available yet today'}.`,
+        reasoning: 'Neither validated approach has a live signal right now — this is the honest answer, not a placeholder.',
+      };
     }
+
+    applyAISignal(json);
+    out.classList.toggle('has-signal', json.bias !== 'WAIT');
+    out.textContent = json.bias === 'WAIT'
+      ? '⏸ WAIT\n\n' + json.wait_reason
+      : `✅ ${json.bias} signal — ${json.scenario_name}\n\n${json.reasoning}\n\nInvalidation: ${json.invalidation}`;
+    $('aiPill').textContent = json.bias === 'WAIT' ? 'Engine: WAIT' : 'Engine: LIVE ✦';
+    $('aiPill').className   = json.bias === 'WAIT' ? 'pill yellow-pill' : 'pill cyan-pill';
 
   } catch (err) {
-    out.textContent = err.message.includes('fetch') || err.message.includes('NetworkError') || err.message.includes('Failed')
-      ? 'Ollama not reachable.\n\n1. Download: https://ollama.com\n2. ollama pull llama3\n3. ollama serve\n4. Click Run AI Signal\n\nError: ' + err.message
-      : 'AI Signal Error: ' + err.message;
-    $('aiPill').textContent = 'Ollama: OFF'; $('aiPill').className = 'pill red-pill';
+    out.textContent = 'Signal engine error: ' + err.message + (err.message.includes('Not connected') ? '' : '\n\nIs server.js running and connected to TradeLocker?');
+    $('aiPill').textContent = 'Engine: OFF'; $('aiPill').className = 'pill red-pill';
+    const dsEl = $('aiDataSource');
+    if (dsEl) { dsEl.textContent = 'NO DATA'; dsEl.className = 'pill red-pill'; }
   }
 
-  setAiThinking(null);
   btn.classList.remove('running');
-  btn.textContent = '🧠 Run AI Signal';
+  btn.textContent = '🎯 Check Validated Signal';
   btn.disabled    = false;
 }
 
@@ -3678,39 +3200,4 @@ function boot() {
   }).catch(() => { scan(); setInterval(tick, 2000); });
 }
 
-// ── Ollama auto-connect: check if Ollama is already running at startup ──────────
-async function checkOllama() {
-  const pill  = $('aiPill');
-  const model = $('ollamaModel');
-  try {
-    const r = await fetch('http://localhost:11434/api/tags', { signal: AbortSignal.timeout(3000) });
-    if (!r.ok) throw new Error('not ok');
-    const data = await r.json();
-    const models = (data.models || []).map(m => m.name);
-    // Pick best available model
-    const preferred = ['llama3','llama3:latest','llama3.1','llama3.2','mistral','gemma2','qwen2'];
-    const best = preferred.find(p => models.some(m => m.startsWith(p))) || models[0];
-    if (best && model) {
-      model.value = best;
-      // Populate dropdown
-      if (model.options.length <= 1) {
-        model.innerHTML = '';
-        models.forEach(m => {
-          const opt = document.createElement('option');
-          opt.value = opt.textContent = m;
-          if (m === best) opt.selected = true;
-          model.appendChild(opt);
-        });
-      }
-    }
-    if (pill) { pill.textContent = `Ollama: ON (${best || 'ready'})`; pill.className = 'pill green-pill'; }
-    console.log('[Ollama] Connected — models:', models.join(', '));
-    return true;
-  } catch (_) {
-    if (pill) { pill.textContent = 'Ollama: OFF'; pill.className = 'pill red-pill'; }
-    return false;
-  }
-}
-
-checkOllama();
 boot();

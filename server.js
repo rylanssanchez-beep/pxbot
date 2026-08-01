@@ -533,6 +533,94 @@ function handleHealth(req, res) {
     instrId: store.instrId, accNum: store.accNum, port: PORT });
 }
 
+// ── Validated signal engine — replaces Ollama as the decision-maker ───────────
+// Same two approaches actually backtested (backtest/ict_engine.js,
+// backtest/orb_engine.js), same configs backtest/signal_now.js verified live:
+//   ICT leg-filter: leg>=199pt (the one filter that held up out-of-sample)
+//   ORB: rangeHour=9/target=0.5x, folds 1+2 only (both profitable, n=137,
+//        +0.110R/trade combined) — fold 4 picked this shape too and went
+//        slightly negative; excluded here by explicit instruction.
+// Neither is proven at scale — every response says so plainly so the UI
+// can never present this as more certain than the real backtest evidence.
+const ictEngine = require('./backtest/ict_engine');
+const orbEngine = require('./backtest/orb_engine');
+
+const SIGNAL_ICT_MIN_LEG  = 199;
+const SIGNAL_ORB_CONFIG   = { ...orbEngine.DEFAULT_ORB, rangeHour: 9, targetMultiple: 0.5, slBufferPct: 0.05, minRangeSize: 100 };
+const ICT_TRACK_RECORD = 'leg>=199pt filter: +0.349R avg train (n=18), +0.405R avg OOS (n=7) — thin sample, not proven.';
+const ORB_TRACK_RECORD = 'rangeHour=9/target=0.5x, folds 1+2 only (both profitable): +0.110R/trade combined (n=137). '
+  + 'Fold 4 picked this same shape and went slightly negative (-0.025R, n=80) — excluded here by request, not silently.';
+
+function signalCtParts(unixSecs) {
+  const d = new Date(new Date(unixSecs * 1000).toLocaleString('en-US', { timeZone: 'America/Chicago' }));
+  return { hour: d.getHours() + d.getMinutes() / 60, dateKey: d.toISOString().slice(0, 10) };
+}
+
+async function handleSignal(req, res) {
+  cors(res);
+  if (!store.token || !store.instrId || !store.infoRouteId) {
+    return send(res, 503, { error: 'Not connected to TradeLocker.' });
+  }
+  try {
+    const [h1, quote] = await Promise.all([
+      loopbackGet('/api/candles?resolution=60&count=19000'),
+      loopbackGet('/api/quote'),
+    ]);
+    if (!h1.bars || !h1.bars.length) return send(res, 200, { ict: null, orb: null, error: 'No candle data yet.' });
+
+    const bars = h1.bars;
+    const now  = bars[bars.length - 1];
+    const { hour, dateKey } = signalCtParts(now.time);
+
+    // --- ICT leg-filter ---
+    const asiaBars = [], londonBars = [];
+    for (const b of bars.slice(-200)) {
+      const p = signalCtParts(b.time);
+      if (p.dateKey === dateKey || (p.hour >= 19 && p.dateKey < dateKey)) {
+        if (p.hour >= 19 || p.hour < 1) asiaBars.push(b);
+        else if (p.hour >= 1 && p.hour < 7) londonBars.push(b);
+      }
+    }
+    let ict = null;
+    if (asiaBars.length && londonBars.length) {
+      const th = { ...ictEngine.DEFAULT_THRESHOLDS, minLegSize: SIGNAL_ICT_MIN_LEG };
+      const cls = ictEngine.classifyDay(asiaBars, londonBars, th);
+      if (cls.id !== 0 && cls.id !== 4) {
+        const levels = ictEngine.legLevels(cls.bias, cls.legLow, cls.legHigh, th);
+        ict = { scenario: cls.id, bias: cls.bias, reason: cls.reason, levels, trackRecord: ICT_TRACK_RECORD };
+      } else {
+        ict = { scenario: cls.id, bias: 'WAIT', reason: cls.reason, trackRecord: ICT_TRACK_RECORD };
+      }
+    }
+
+    // --- ORB ---
+    let orb = null;
+    const rangeBar = bars.slice(-30).find(b => { const p = signalCtParts(b.time); return p.dateKey === dateKey && Math.floor(p.hour) === SIGNAL_ORB_CONFIG.rangeHour; });
+    if (rangeBar) {
+      const size = rangeBar.high - rangeBar.low;
+      if (hour <= SIGNAL_ORB_CONFIG.rangeHour + 1) {
+        orb = { bias: 'WAIT', reason: 'still inside the range hour', rangeBar, trackRecord: ORB_TRACK_RECORD };
+      } else if (size < SIGNAL_ORB_CONFIG.minRangeSize) {
+        orb = { bias: 'WAIT', reason: `range too small (< ${SIGNAL_ORB_CONFIG.minRangeSize}pt floor)`, rangeBar, trackRecord: ORB_TRACK_RECORD };
+      } else if (quote.last > rangeBar.high) {
+        const sl = rangeBar.low - size * SIGNAL_ORB_CONFIG.slBufferPct;
+        const target = quote.last + size * SIGNAL_ORB_CONFIG.targetMultiple;
+        orb = { bias: 'BUY', entry: quote.last, sl, target, rangeBar, trackRecord: ORB_TRACK_RECORD };
+      } else if (quote.last < rangeBar.low) {
+        const sl = rangeBar.high + size * SIGNAL_ORB_CONFIG.slBufferPct;
+        const target = quote.last - size * SIGNAL_ORB_CONFIG.targetMultiple;
+        orb = { bias: 'SELL', entry: quote.last, sl, target, rangeBar, trackRecord: ORB_TRACK_RECORD };
+      } else {
+        orb = { bias: 'WAIT', reason: 'still inside the range, no breakout yet', rangeBar, trackRecord: ORB_TRACK_RECORD };
+      }
+    }
+
+    send(res, 200, { ict, orb, quote: quote.last, asOf: now.time });
+  } catch (e) {
+    send(res, 500, { error: e.message });
+  }
+}
+
 // ── Server-Sent Events: real-time price stream (1 second ticks) ───────────────
 const sseClients  = new Set();
 let latestQuote   = { last: 0, bid: 0, ask: 0, change: 0, changePct: 0, dayHigh: 0, dayLow: 0, spread: 0, symbol: '', source: 'none', time: 0 };
@@ -1336,6 +1424,7 @@ http.createServer((req, res) => {
   if (p === '/api/quote'     && req.method === 'GET')  return handleQuote(req, res);
   if (p === '/api/positions' && req.method === 'GET')  return handlePositions(req, res);
   if (p === '/api/health'    && req.method === 'GET')  return handleHealth(req, res);
+  if (p === '/api/signal'    && req.method === 'GET')  return handleSignal(req, res);
   if (p === '/api/debug'     && req.method === 'GET')  return send(res, 200, { instrId: store.instrId, instrName: store.instrName, instrDesc: store.instrDesc, allRoutes: store.allRoutes, infoRouteId: store.infoRouteId, tradeRouteId: store.tradeRouteId, accountId: store.accountId, accNum: store.accNum, hasToken: !!store.token, balance: store.balance });
   if (p === '/api/stream'    && req.method === 'GET')  return handleStream(req, res);
   if (p === '/api/context'   && req.method === 'GET')  return handleContext(req, res);

@@ -21,7 +21,7 @@
     <span id="sessionPill" class="pill yellow-pill">--</span>
     <span id="windowCountdown" class="window-countdown">Next window: --</span>
     <span id="tlPill" class="pill red-pill">TradeLocker: OFF</span>
-    <span id="aiPill" class="pill muted-pill">Ollama: OFF</span>
+    <span id="aiPill" class="pill muted-pill">Engine: OFF</span>
   </div>
   <div class="live-ticker" id="liveTicker">
     <div class="ticker-block">
@@ -222,7 +222,7 @@
         <span id="liveTag" class="pill muted-pill" style="font-size:10px">SIM</span>
         <button id="tradingModeBtn" class="trading-mode-btn off" onclick="toggleTradingMode()" title="Toggle bot scanning on/off">&#9673; BOT: OFF</button>
         <span id="botScanPulse" class="bot-scan-pulse" style="display:none" title="Bot is actively scanning for trades">&#9679; SCANNING</span>
-        <button id="runAiSignal" class="ai-signal-btn">&#129504; Run AI Signal</button>
+        <button id="runAiSignal" class="ai-signal-btn">&#127919; Check Validated Signal</button>
         <button id="scanNow" class="accent-btn">&#8635; Sim Re-Scan</button>
         <button id="replayToggle" class="replay-btn">&#9654; Bar Replay</button>
       </div>
@@ -435,19 +435,11 @@
     </div>
   </div>
 
-  <!-- AI SIGNAL ENGINE -->
+  <!-- VALIDATED SIGNAL ENGINE -->
   <div class="panel ai-panel">
     <div class="panel-head">
-      <h2>&#129504; Ollama — AI Signal Engine</h2>
+      <h2>&#127919; Validated Signal Engine</h2>
       <div class="toolbar">
-        <select id="ollamaModel" style="background:#1f2430;color:#eef3fb;border:1px solid #2d3442;border-radius:6px;padding:6px 8px;font:inherit">
-          <option value="llama3">llama3</option>
-          <option value="llama3:70b">llama3:70b</option>
-          <option value="mistral">mistral</option>
-          <option value="phi3">phi3</option>
-          <option value="gemma">gemma</option>
-          <option value="deepseek-r1">deepseek-r1</option>
-        </select>
         <span id="aiDataSource" class="pill muted-pill" style="font-size:10px">SIM DATA</span>
       </div>
     </div>
@@ -456,15 +448,13 @@
       <span id="aiThinkingLabel">Fetching NQ data…</span>
     </div>
     <div id="aiOutput" class="ai-output">
-      <span class="muted">AI is the signal engine. Click <strong style="color:var(--cyan)">Run AI Signal</strong> (top of chart) and Ollama will:<br><br>
-      1. Receive the full NQ candle dataset<br>
-      2. Identify today's scenario itself (no hardcoded rules)<br>
-      3. Calculate its own entry, stop, and target<br>
-      4. Update every panel on this screen<br><br>
-      Requires Ollama running locally: <code>ollama serve</code></span>
+      <span class="muted">Click <strong style="color:var(--cyan)">Check Validated Signal</strong> (top of chart) to check the two backtested approaches against live TradeLocker data:<br><br>
+      1. ICT leg-filter (Asia/London leg &ge;199pt, OTE entry) — +0.405R avg OOS, n=7 (thin sample)<br>
+      2. Opening Range Breakout (9-10am CT range, folds 1+2 only) — +0.110R/trade, n=137<br><br>
+      No local install needed — this runs against real TradeLocker candles server-side.</span>
     </div>
     <div id="aiConfidence" class="ai-confidence" style="display:none">
-      <span class="muted">AI Confidence</span>
+      <span class="muted">Signal Confidence</span>
       <div class="conf-bar"><div id="confFill" class="conf-fill"></div></div>
       <strong id="confPct">--</strong>
     </div>
