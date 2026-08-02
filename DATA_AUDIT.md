@@ -172,18 +172,43 @@ existing practice should be the template for every new status/claim the upgraded
 
 ## 9. What Part 2 must fix, precisely
 
-1. Replace the 35-day `handleBacktest` cap and the 6-month NDX fallback target with a real
-   paginated downloader against `/trade/history` that keeps requesting older windows until TL
-   returns empty (same signal `fetch_deep.js` already uses to detect the end of history) —
-   for **every** required resolution (1m/5m/15m/30m/1H/4H/1D), not just one.
-   **TL max bars/request is NOT yet empirically verified.** This sandboxed session has no live
-   TradeLocker credentials or network path to `bsa.tradelocker.com`, so no real request has been
-   made here — the `~20,000/request` and `chunkDays` figures in `fetch_deep.js` remain an
-   *assumption* from code comments, not a measurement. The downloader built in Part 2 runs an
-   explicit probe (a wide request compared against a request known to return few bars) on first
-   connection and writes the measured per-resolution cap to `DATA_INTEGRITY_REPORT.json` — that
-   file, once generated on a machine with real account access, is the authoritative source, not
-   this document.
+1. **DONE — verified live against the connected account (NAS100 / GenFX / instrumentId 8530 /
+   routeId 541038).** `scripts/probe_tl_history.js` disproved the old "~20,000 bars/request" cap
+   assumption: TradeLocker does not truncate an oversized window to a fixed bar count, it returns
+   **empty** once the implied bar count gets too large (1-minute: works at 30 days/27,612 bars,
+   fails outright at 60 days). `data/downloader.js` was built around that measured behavior
+   (adaptive window-shrinking, not a fixed chunk size) and then run to full completion for every
+   required resolution. Final, real, measured results (`data/logs/DATA_INTEGRITY_REPORT.json`,
+   generated 2026-08-02, zero duplicates/malformed/out-of-order bars across all seven
+   resolutions):
+
+   | Resolution | Bars stored | Oldest | Newest | Span |
+   |---|---|---|---|---|
+   | 1D  | 3,080   | 2015-04-13 | 2026-07-31 | ~11.3 years |
+   | 4H  | 4,105   | 2024-01-01 | 2026-07-31 | ~2.6 years |
+   | 1H  | 15,440  | 2024-01-01 | 2026-07-31 | ~2.6 years |
+   | 30m | 30,553  | 2024-01-01 | 2026-07-31 | ~2.6 years |
+   | 15m | 60,767  | 2024-01-01 | 2026-07-31 | ~2.6 years |
+   | 5m  | 51,799  | 2025-11-06 | 2026-07-31 | ~267 days |
+   | 1m  | 258,487 | 2025-11-06 | 2026-07-31 | ~267 days |
+
+   **Important, honestly-discovered constraint:** retention depth is not uniform across
+   resolutions. Four independent resolutions (15m/30m/1H/4H) all bottomed out at exactly
+   2024-01-01, and two independent resolutions (5m/1m) both bottomed out at exactly 2025-11-06 —
+   that agreement across independently-paginated resolutions confirms these are genuine
+   broker-side retention floors for this account/instrument, not an artifact of window-size
+   tuning. **True 1-minute-execution backtesting is therefore bounded to ~267 days of real data,
+   not years.** This directly constrains Part 8 (1,000-trade validation): a single narrow
+   session-specific setup trading a few times a week cannot reach 1,000 real 1-minute-execution
+   trades from this window alone — the mission's own honest fallback (a diversified ensemble of
+   independently-validated session strategies, or accepting hourly-approximated execution for the
+   deeper 2.6-year history with the caveats the existing code already discloses) will be needed,
+   not a lowered standard. The store is incrementally updatable (checkpointed top-up), so this
+   window will keep growing forward in real time as the app keeps running.
+
+   Residual "unexplained" gaps after weekend-closure filtering (21 for 1D, ~9-10 for
+   4H/1H/30m/15m, 4 for 5m/1m) were manually spot-checked and line up with real US market
+   holidays (Christmas, New Year, Good Friday, July 4th, Thanksgiving) — not data defects.
 2. Persist results in a durable, queryable local store (not flat JSON) — see `data/` design in
    `IMPLEMENTATION_CHANGELOG.md`.
 3. Add checkpoint/resume so an interrupted download continues instead of restarting.
