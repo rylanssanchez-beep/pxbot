@@ -2859,43 +2859,16 @@ async function runAISignal() {
       premium_discount_aligned: factorAgrees('dailyPricePosition') || factorAgrees('mtfFractalAlignment'),
     } : { confidence: null, confluence_score: null, order_block_in_ote: false, fvg_in_ote: false, premium_discount_aligned: false };
 
+    // Only the premarket breakout is shown as an actionable trade — it's the
+    // only one of the three that passed every validation check without a
+    // real caveat attached to the core number (see PREMARKET_TRACK_RECORD).
+    // ICT (thin held-out sample, negative on the bigger test) and ORB
+    // (currently losing in the most recent weeks tested) still compute and
+    // log to the journal every check — server.js unchanged, still gathering
+    // real evidence in case either one's picture improves — but neither
+    // surfaces as something to trade right now. Fewer signals, on purpose.
     let json;
-    if (ictFired) {
-      const lv = ict.levels;
-      const entryMid = (lv.oteLow + lv.oteHigh) / 2;
-      const risk = Math.abs(entryMid - lv.sl);
-      json = {
-        scenario: ict.scenario, scenario_name: (SCENARIOS[ict.scenario]?.name || ('S' + ict.scenario)) + ' (validated engine)',
-        bias: ict.bias, wait_reason: null,
-        entry_window: 'nyopen', entry_window_note: 'ICT leg-filter (leg≥199pt) — enter on the OTE pullback. MANAGED EXIT: ' + (ict.managementPlan || ''),
-        ote_entry_low: lv.oteLow, ote_entry_high: lv.oteHigh,
-        stop: lv.sl, target: lv.tp2, stop_pts: +risk.toFixed(2), target_pts: +Math.abs(lv.tp2 - entryMid).toFixed(2),
-        tp1: lv.tp1, tp2: lv.tp2, tp3: lv.tp3,
-        tp1_pts: +Math.abs(lv.tp1 - entryMid).toFixed(2), tp2_pts: +Math.abs(lv.tp2 - entryMid).toFixed(2), tp3_pts: +Math.abs(lv.tp3 - entryMid).toFixed(2),
-        rr: +(Math.abs(lv.tp2 - entryMid) / Math.max(0.25, risk)).toFixed(1),
-        ...confFields,
-        reasoning: `Validated ICT leg-filter engine: ${ict.reason}. Track record: ${ict.trackRecord}` + (orbFired ? ` [ORB also fired this bar — see below]` : '')
-          + (ict.managementPlan ? ` | MANAGE THIS TRADE: ${ict.managementPlan}` : '')
-          + (conf ? ` | Confirmation engine: ${conf.tier} tier, ${conf.confidence}% confidence (${conf.agreeingCount} agree / ${conf.disagreeingCount} disagree) — context only, not a live-validated gate yet.` : ''),
-        invalidation: lv.sl,
-      };
-    } else if (orbFired) {
-      const risk = Math.abs(orb.entry - orb.sl);
-      json = {
-        scenario: 0, scenario_name: 'Opening Range Breakout (validated engine)',
-        bias: orb.bias, wait_reason: null,
-        entry_window: 'nyopen', entry_window_note: 'ORB breakout of the 9–10 AM CT range — already triggered, this is a market entry.',
-        ote_entry_low: orb.entry, ote_entry_high: orb.entry,
-        stop: orb.sl, target: orb.target, stop_pts: +risk.toFixed(2), target_pts: +Math.abs(orb.target - orb.entry).toFixed(2),
-        tp1: 0, tp2: orb.target, tp3: 0,
-        tp1_pts: 0, tp2_pts: +Math.abs(orb.target - orb.entry).toFixed(2), tp3_pts: 0,
-        rr: +(Math.abs(orb.target - orb.entry) / Math.max(0.25, risk)).toFixed(1),
-        ...confFields,
-        reasoning: `Validated ORB engine: breakout of the opening range. Track record: ${orb.trackRecord}`
-          + (conf ? ` | Confirmation engine: ${conf.tier} tier, ${conf.confidence}% confidence (${conf.agreeingCount} agree / ${conf.disagreeingCount} disagree) — context only, not a live-validated gate yet.` : ''),
-        invalidation: orb.sl,
-      };
-    } else if (premarketFired) {
+    if (premarketFired) {
       const risk = Math.abs(premarket.entry - premarket.sl);
       json = {
         scenario: 0, scenario_name: 'NY Premarket Breakout (validated engine — strongest evidence)',
@@ -2912,10 +2885,13 @@ async function runAISignal() {
         invalidation: premarket.sl,
       };
     } else {
+      const heldBackNote = (ictFired || orbFired)
+        ? ` (ICT and/or ORB did fire today, but are intentionally not shown as trades right now — weaker/mixed evidence, kept as background research only. See the rundown for why.)`
+        : '';
       json = {
         scenario: 0, scenario_name: 'No signal', bias: 'WAIT',
-        wait_reason: `ICT: ${ict ? ict.reason : 'not enough Asia/London data yet today'}. ORB: ${orb ? orb.reason : 'range hour not available yet today'}. Premarket: ${premarket ? premarket.reason : 'not available yet today'}.`,
-        reasoning: 'None of the three validated approaches have a live signal right now — this is the honest answer, not a placeholder.',
+        wait_reason: `Premarket: ${premarket ? premarket.reason : 'not available yet today'}.${heldBackNote}`,
+        reasoning: 'Only trading the premarket breakout right now — the one strategy with real evidence behind it at every check applied. Fewer signals, on purpose.',
       };
     }
 
