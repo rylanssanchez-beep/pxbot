@@ -269,10 +269,29 @@ function tradesFromOrb(bars, params) {
 // mechanically distinct from ORB (prior CALENDAR DAY's full range, not a
 // single opening hour): once NY regular hours begin, the first break of
 // yesterday's high or low is traded as continuation.
+// Cached by timestamp — toLocaleString-with-timeZone is expensive, and the
+// 1-minute candidates below call this across 258k bars × grid × folds.
+const _ctPartsByTime = new Map();
 function ctParts(unixSecs) {
-  const d = new Date(new Date(unixSecs * 1000).toLocaleString('en-US', { timeZone: 'America/Chicago' }));
-  return { hour: d.getHours() + d.getMinutes() / 60, dateKey: d.toISOString().slice(0, 10), dow: d.getDay() };
+  let p = _ctPartsByTime.get(unixSecs);
+  if (!p) {
+    const d = new Date(new Date(unixSecs * 1000).toLocaleString('en-US', { timeZone: 'America/Chicago' }));
+    p = { hour: d.getHours() + d.getMinutes() / 60, dateKey: d.toISOString().slice(0, 10), dow: d.getDay() };
+    _ctPartsByTime.set(unixSecs, p);
+  }
+  return p;
 }
+
+// ── HARD OPERATOR CONSTRAINT: maximum 30-point protective stop on NAS100 ──
+// Stated explicitly by the operator (funded-account rules/sizing). Any
+// signal whose stop distance exceeds this is SKIPPED — exactly what the
+// operator would do live. Note the honest consequence, reported rather than
+// hidden: at a 30pt stop, the base cost model (2pt spread + 1pt slippage)
+// is already >=0.1R per trade, and every hourly-structure strategy in this
+// codebase (ORB, session breakouts, hourly FVG >=40pt gaps) uses stops
+// structurally wider than 30pts — so capped candidates must be built on
+// 1-minute structures, where only ~267 days of real data exist.
+const MAX_STOP_POINTS = 30;
 function tradesFromPrevDayLevel(bars, params) {
   const th = { targetMultiple: 1, slBufferPct: 0.1, minRangeSize: 0, maxHoldBars: 12, allowedDaysOfWeek: [0, 1, 2, 3, 4, 5, 6], ...params };
   const byDate = new Map();
@@ -488,6 +507,174 @@ function tradesFromAsiaInternalFade(bars, params) {
   return out;
 }
 
+// ── 1-MINUTE, ≤30pt-stop candidates (operator's hard constraint) ──────────
+
+// 1m Fair Value Gap continuation — same objective 3-bar imbalance as the
+// validated hourly family, at 1-minute scale where gaps are 5-15pts and the
+// stop (just beyond the gap) fits the 30pt cap naturally. Separate function
+// from tradesFromFvgContinuation on purpose: (1) bounded forward-window
+// slicing (full-array slices per signal would be O(n^2) at 258k bars),
+// (2) time-contiguity check so a weekend/halt boundary is never mistaken
+// for an intrabar imbalance, (3) chronological non-overlap — after a fill,
+// scanning resumes past that trade's exit, so two signals can never hold
+// positions simultaneously (Part 8: no overlapping duplicate signals), and
+// (4) the hard maxStopPoints skip. The validated hourly function stays
+// byte-identical.
+function tradesFromFvg1m(bars, params) {
+  const th = { targetRMultiple: 1, slBufferPct: 0.2, minGapSize: 8, maxWaitBars: 15, maxHoldBars: 45, allowedDaysOfWeek: [1, 2, 3, 4, 5], ...params };
+  const out = [];
+  let i = 2;
+  while (i < bars.length - 1) {
+    const { dow } = ctParts(bars[i].time);
+    if (!th.allowedDaysOfWeek.includes(dow)) { i++; continue; }
+    const left = bars[i - 2], right = bars[i];
+    if (right.time - left.time > 600) { i++; continue; } // non-contiguous minutes (session boundary) — not a real imbalance
+    let bias = null, gapLow = null, gapHigh = null;
+    if (left.high < right.low && (right.low - left.high) >= th.minGapSize) { bias = 'LONG'; gapLow = left.high; gapHigh = right.low; }
+    else if (left.low > right.high && (left.low - right.high) >= th.minGapSize) { bias = 'SHORT'; gapLow = right.high; gapHigh = left.low; }
+    if (!bias) { i++; continue; }
+
+    const forward = bars.slice(i + 1, i + 1 + th.maxWaitBars + th.maxHoldBars + 10);
+    let entryIdx = -1, entryPrice = null;
+    for (let k = 0; k < Math.min(forward.length, th.maxWaitBars); k++) {
+      const b = forward[k];
+      if (b.low <= gapHigh && b.high >= gapLow) {
+        entryIdx = k;
+        entryPrice = bias === 'LONG' ? Math.min(gapHigh, b.high) : Math.max(gapLow, b.low);
+        break;
+      }
+    }
+    if (entryIdx === -1) { i++; continue; }
+
+    const gapSize = gapHigh - gapLow;
+    const sl = bias === 'LONG' ? gapLow - gapSize * th.slBufferPct : gapHigh + gapSize * th.slBufferPct;
+    const risk = Math.abs(entryPrice - sl);
+    if (!(risk > 0) || risk > MAX_STOP_POINTS) { i++; continue; } // operator's hard 30pt stop cap
+    const target = bias === 'LONG' ? entryPrice + risk * th.targetRMultiple : entryPrice - risk * th.targetRMultiple;
+
+    const r = simulateTrade({
+      bars: forward, signalIndex: entryIdx - 1, direction: bias, orderType: 'preComputedFill',
+      precomputedEntryIndex: entryIdx, precomputedEntryPriceRaw: entryPrice,
+      stopPrice: sl, targetPrice: target, exitPlan: { maxHoldingBars: th.maxHoldBars }, costModel: COST_MODEL,
+    });
+    if (r.filled) {
+      out.push(r);
+      i = i + 1 + entryIdx + Math.max(1, r.holdingBars || 1); // resume past this trade's exit — no overlapping positions
+    } else i++;
+  }
+  return out;
+}
+
+// Micro opening-range breakout on 1m bars — the NY premarket/open coverage
+// under the 30pt cap. Range = first `rangeMinutes` of the 08:30 CT cash
+// open; breakout entry; stop at the opposite side + small fixed buffer.
+// The cap does the day-selection: a day whose opening range implies a stop
+// wider than 30pts is skipped entirely (compressed-open days only) —
+// that's the honest way to respect the constraint, not shrinking stops to
+// fit and getting noise-stopped.
+function tradesFromMicroOrb1m(bars, params) {
+  const th = { rangeMinutes: 15, targetMultiple: 1.5, slBufferPts: 2, entryCutoffHour: 12, allowedDaysOfWeek: [1, 2, 3, 4, 5], ...params };
+  const byDate = new Map();
+  for (const b of bars) {
+    const { hour, dateKey, dow } = ctParts(b.time);
+    if (!byDate.has(dateKey)) byDate.set(dateKey, { range: [], forward: [], dow });
+    const day = byDate.get(dateKey);
+    const rangeEnd = 8.5 + th.rangeMinutes / 60;
+    if (hour >= 8.5 && hour < rangeEnd) day.range.push(b);
+    else if (hour >= rangeEnd && hour < 19) day.forward.push(b);
+  }
+  const out = [];
+  for (const [dateKey, day] of byDate.entries()) {
+    if (!th.allowedDaysOfWeek.includes(day.dow)) continue;
+    if (day.range.length < th.rangeMinutes * 0.6 || !day.forward.length) continue; // enough real bars to trust the range
+    const hi = Math.max(...day.range.map(b => b.high));
+    const lo = Math.min(...day.range.map(b => b.low));
+    const size = hi - lo;
+    if (size <= 0) continue;
+    const stopDist = size + th.slBufferPts;
+    if (stopDist > MAX_STOP_POINTS) continue; // operator's hard 30pt stop cap — skips wide-open days entirely
+
+    let bias = null, entryIdx = -1, entryPrice = null;
+    for (let k = 0; k < day.forward.length; k++) {
+      const b = day.forward[k];
+      if (ctParts(b.time).hour >= th.entryCutoffHour) break; // NY AM only, per operator's session requirement
+      if (b.high > hi) { bias = 'LONG'; entryPrice = hi; entryIdx = k; break; }
+      if (b.low < lo) { bias = 'SHORT'; entryPrice = lo; entryIdx = k; break; }
+    }
+    if (!bias) continue;
+
+    const sl = bias === 'LONG' ? lo - th.slBufferPts : hi + th.slBufferPts;
+    const risk = Math.abs(entryPrice - sl);
+    if (!(risk > 0)) continue;
+    const target = bias === 'LONG' ? entryPrice + risk * th.targetMultiple : entryPrice - risk * th.targetMultiple;
+
+    const r = simulateTrade({
+      bars: day.forward, signalIndex: -1, direction: bias, orderType: 'preComputedFill',
+      precomputedEntryIndex: entryIdx, precomputedEntryPriceRaw: entryPrice,
+      stopPrice: sl, targetPrice: target,
+      exitPlan: { maxHoldingBars: day.forward.length, sessionCloseAfterHour: 15 },
+      costModel: COST_MODEL, ctPartsFn: ctParts,
+    });
+    if (r.filled) out.push(r);
+  }
+  return out;
+}
+
+// Asia internal fade at 1m with FIXED-POINT stops/targets (both ≤30pts by
+// construction). Range = first `rangeMinutes` of Asia (from 19:00 CT);
+// first touch of an extreme fades back toward the interior. Exit at Asia
+// session end as a genuine TIME exit (London 1m bars appended past the
+// hold cap).
+function tradesFromAsiaFade1m(bars, params) {
+  const th = { rangeMinutes: 60, stopPoints: 20, targetPoints: 12, minRangeSize: 20, allowedDaysOfWeek: [0, 1, 2, 3, 4, 5, 6], ...params };
+  if (th.stopPoints > MAX_STOP_POINTS) return []; // config itself violates the cap — untradeable, zero trades
+  const byDay = new Map();
+  for (const b of bars) {
+    const { hour } = ctParts(b.time);
+    const shiftedKey = ctParts(b.time + 6 * 3600).dateKey;
+    if (!byDay.has(shiftedKey)) byDay.set(shiftedKey, { asia: [], london: [] });
+    const day = byDay.get(shiftedKey);
+    if (hour >= 19 || hour < 1) day.asia.push(b);
+    else if (hour >= 1 && hour < 7) day.london.push(b);
+  }
+  const out = [];
+  for (const [dateKey, day] of byDay.entries()) {
+    if (day.asia.length <= th.rangeMinutes) continue;
+    const { dow } = ctParts(day.asia[day.asia.length - 1].time + 6 * 3600);
+    if (!th.allowedDaysOfWeek.includes(dow)) continue;
+    const rangeBars = day.asia.slice(0, th.rangeMinutes);
+    const rest = day.asia.slice(th.rangeMinutes);
+    const hi = Math.max(...rangeBars.map(b => b.high));
+    const lo = Math.min(...rangeBars.map(b => b.low));
+    const size = hi - lo;
+    if (size <= 0 || size < th.minRangeSize) continue;
+
+    let bias = null, entryIdx = -1, entryPrice = null;
+    for (let k = 0; k < rest.length; k++) {
+      const b = rest[k];
+      const touchedHi = b.high >= hi, touchedLo = b.low <= lo;
+      if (touchedHi && touchedLo) break; // one bar through both sides — no clean read
+      if (touchedHi) { bias = 'SHORT'; entryPrice = hi; entryIdx = k; break; }
+      if (touchedLo) { bias = 'LONG'; entryPrice = lo; entryIdx = k; break; }
+    }
+    if (!bias) continue;
+
+    const sl = bias === 'SHORT' ? entryPrice + th.stopPoints : entryPrice - th.stopPoints;
+    const target = bias === 'SHORT' ? entryPrice - th.targetPoints : entryPrice + th.targetPoints;
+
+    const asiaExec = rest.slice(entryIdx);
+    const execBars = [...asiaExec, ...day.london];
+    const r = simulateTrade({
+      bars: execBars, signalIndex: -1, direction: bias, orderType: 'preComputedFill',
+      precomputedEntryIndex: 0, precomputedEntryPriceRaw: entryPrice,
+      stopPrice: sl, targetPrice: target,
+      exitPlan: { maxHoldingBars: Math.max(1, asiaExec.length - 1) }, costModel: COST_MODEL,
+    });
+    if (r.filled) out.push(r);
+  }
+  return out;
+}
+
 // ── Candidate registry: family label -> { tradeFn, grid } ─────────────────
 const DAY_FILTERS = {
   allDays: [0, 1, 2, 3, 4, 5, 6], skipMonday: [0, 2, 3, 4, 5, 6], tueThuOnly: [2, 3, 4],
@@ -587,6 +774,19 @@ const CANDIDATES = {
     // already cross-validated in 5/5 folds for this family; only the
     // target/stop shape (the win-rate lever) is searched.
     grid: grid({ targetRMultiple: [0.25, 0.33, 0.5], slBufferPct: [0.1, 0.15, 0.2], minGapSize: [40, 50], maxWaitBars: [10], allowedDaysOfWeek: [[2, 3, 4]] }),
+  },
+  // ── ≤30pt-stop candidates on REAL 1-minute data (operator's hard cap) ──
+  fvg_1m_capped: {
+    fn: tradesFromFvg1m, selectBy: 'winRate', data: '1m',
+    grid: grid({ minGapSize: [5, 8, 12], targetRMultiple: [0.5, 1], slBufferPct: [0.2], maxWaitBars: [15], maxHoldBars: [45], allowedDaysOfWeek: [[1, 2, 3, 4, 5], [2, 3, 4]] }),
+  },
+  micro_orb_1m_capped: {
+    fn: tradesFromMicroOrb1m, selectBy: 'winRate', data: '1m',
+    grid: grid({ rangeMinutes: [5, 15], targetMultiple: [1, 1.5], slBufferPts: [2], allowedDaysOfWeek: [[1, 2, 3, 4, 5], [2, 3, 4]] }),
+  },
+  asia_fade_1m_capped: {
+    fn: tradesFromAsiaFade1m, selectBy: 'winRate', data: '1m',
+    grid: grid({ rangeMinutes: [60], stopPoints: [20, 30], targetPoints: [8, 12, 18], minRangeSize: [20, 40], allowedDaysOfWeek: [[0, 1, 2, 3, 4, 5, 6], [0, 2, 3, 4, 5, 6]] }),
   },
 };
 
@@ -696,7 +896,9 @@ function runWalkForward(label, bars, spec) {
 (async () => {
   const store = new MarketDataStore();
   const hourlyBars = store.getAllBars(SYMBOL, '1H', 'tradelocker');
-  console.log(`Loaded ${hourlyBars.length} 1H bars (${new Date(hourlyBars[0].time * 1000).toISOString().slice(0, 10)} .. ${new Date(hourlyBars.at(-1).time * 1000).toISOString().slice(0, 10)})\n`);
+  console.log(`Loaded ${hourlyBars.length} 1H bars (${new Date(hourlyBars[0].time * 1000).toISOString().slice(0, 10)} .. ${new Date(hourlyBars.at(-1).time * 1000).toISOString().slice(0, 10)})`);
+  const minuteBars = store.getAllBars(SYMBOL, '1m', 'tradelocker');
+  console.log(`Loaded ${minuteBars.length} 1m bars (${new Date(minuteBars[0].time * 1000).toISOString().slice(0, 10)} .. ${new Date(minuteBars.at(-1).time * 1000).toISOString().slice(0, 10)})\n`);
 
   const hash = codeHash([
     __filename, require.resolve('./trend_pullback_engine'), require.resolve('./vwap_reversion_engine'),
@@ -709,8 +911,9 @@ function runWalkForward(label, bars, spec) {
   const results = {};
   for (const [label, spec] of Object.entries(CANDIDATES)) {
     if (!wanted.includes(label)) continue;
-    console.log(`=== ${label} (grid size ${spec.grid.length}) ===`);
-    const r = runWalkForward(label, hourlyBars, spec);
+    const dataBars = spec.data === '1m' ? minuteBars : hourlyBars;
+    console.log(`=== ${label} (grid size ${spec.grid.length}, data: ${spec.data === '1m' ? '1-minute' : 'hourly'}) ===`);
+    const r = runWalkForward(label, dataBars, spec);
     results[label] = r;
     console.log(`  Walk-forward: ${r.verdict.positiveFolds}/${r.verdict.validFolds} folds profitable OOS, ${r.verdict.uniqueConfigs} distinct configs (most common repeated ${r.verdict.mostCommonCount}x), combined OOS avgR=${r.verdict.combinedOosAvgR} (n=${r.verdict.combinedOosTrades})`);
 
@@ -730,7 +933,7 @@ function runWalkForward(label, bars, spec) {
     const runId = `phase5_${label}`;
     store.insertExperiment({
       runId, strategyId: label, strategyVersion: 'v1', codeHash: hash,
-      dataRange: `${hourlyBars.length} 1H bars`, instrument: SYMBOL, session: label,
+      dataRange: spec.data === '1m' ? `${minuteBars.length} 1m bars` : `${hourlyBars.length} 1H bars`, instrument: SYMBOL, session: label,
       params: { grid: spec.grid.length, costModel: COST_MODEL },
       costs: COST_MODEL,
       splits: { folds: NUM_FOLDS, holdoutFraction: HOLDOUT_FRACTION, minTrainTrades: MIN_TRAIN_TRADES },
