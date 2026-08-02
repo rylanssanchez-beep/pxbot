@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "status": "baseline",
+  "note": "Equal-weighted starting point, NOT yet backtested/validated against real history — this sandbox has no live TradeLocker credentials. Mirrors engine/confirmation_engine.js's DEFAULT_WEIGHTS exactly. Only backtest/apply_weights.js may promote a reviewed engine/confirmation_weights.proposed.json over this file, and only after a human runs it deliberately — nothing auto-applies a weight change.",
+  "weights": {
+    "mtfStructureAgreement": 1,
+    "mtfFractalAlignment": 1,
+    "dailyPricePosition": 1,
+    "regimeTrendAlignment": 1,
+    "liquiditySweepAlignment": 1,
+    "fvgConfluence": 1,
+    "orderBlockConfluence": 1,
+    "displacementPresent": 1,
+    "vwapRelationship": 1,
+    "crossStrategyAgreement": 1,
+    "smtConfirmation": 1
+  }
+}
