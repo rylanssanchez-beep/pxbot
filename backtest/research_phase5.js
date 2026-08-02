@@ -420,6 +420,74 @@ function tradesFromOrbFailure(bars, params) {
   return out;
 }
 
+// ── Asia internal range fade — trades DURING the Asia session itself
+// (19:00-01:00 CT), which no existing module does (every prior Asia-anchored
+// candidate traded the NEXT sessions against Asia's completed range). The
+// first `rangeBars` hourly bars of Asia define an initial range; the first
+// subsequent touch of the range high is faded SHORT (low faded LONG) back
+// toward the range interior. High-win-rate SHAPE by construction: small
+// target (targetFraction of range size), wide stop (stopFraction of range
+// size beyond the touched level), exit at Asia session end if neither hits.
+// Trading-day bucketing uses a +6h shift (19:00+6h lands on the next
+// calendar date, matching ict_engine.js's Asia-rollover convention exactly,
+// without duplicating its slicing code).
+function tradesFromAsiaInternalFade(bars, params) {
+  const th = { rangeBars: 2, targetFraction: 0.33, stopFraction: 0.75, minRangeSize: 30, allowedDaysOfWeek: [0, 1, 2, 3, 4, 5, 6], ...params };
+  const byDay = new Map();
+  for (const b of bars) {
+    const { hour } = ctParts(b.time);
+    const shiftedKey = ctParts(b.time + 6 * 3600).dateKey;
+    if (!byDay.has(shiftedKey)) byDay.set(shiftedKey, { asia: [], london: [] });
+    const day = byDay.get(shiftedKey);
+    if (hour >= 19 || hour < 1) day.asia.push(b);
+    else if (hour >= 1 && hour < 7) day.london.push(b);
+  }
+  const out = [];
+  for (const [dateKey, day] of byDay.entries()) {
+    if (day.asia.length <= th.rangeBars) continue;
+    const { dow } = ctParts(day.asia[day.asia.length - 1].time + 6 * 3600);
+    if (!th.allowedDaysOfWeek.includes(dow)) continue;
+    const rangeBars = day.asia.slice(0, th.rangeBars);
+    const rest = day.asia.slice(th.rangeBars);
+    const hi = Math.max(...rangeBars.map(b => b.high));
+    const lo = Math.min(...rangeBars.map(b => b.low));
+    const size = hi - lo;
+    if (size <= 0 || size < th.minRangeSize) continue;
+
+    let bias = null, entryIdx = -1, entryPrice = null;
+    for (let i = 0; i < rest.length; i++) {
+      const b = rest[i];
+      const touchedHi = b.high >= hi, touchedLo = b.low <= lo;
+      if (touchedHi && touchedLo) break; // one giant bar through both sides — no clean read, skip the day
+      if (touchedHi) { bias = 'SHORT'; entryPrice = hi; entryIdx = i; break; }
+      if (touchedLo) { bias = 'LONG'; entryPrice = lo; entryIdx = i; break; }
+    }
+    if (!bias) continue;
+
+    const sl = bias === 'SHORT' ? hi + size * th.stopFraction : lo - size * th.stopFraction;
+    const target = bias === 'SHORT' ? hi - size * th.targetFraction : lo + size * th.targetFraction;
+    const risk = Math.abs(entryPrice - sl);
+    if (!(risk > 0)) continue;
+
+    // Execution: remaining Asia bars from the touch, PLUS that day's London
+    // bars appended past the maxHoldingBars cap — so an exit at Asia's end
+    // is a genuine, kept TIME exit (bars exist beyond it), never a silently
+    // excluded END_OF_DATA truncation. Same anti-pattern fix as
+    // tradesFromPrevDayLevel — applied at construction this time, not after
+    // a bug report.
+    const asiaExec = rest.slice(entryIdx);
+    const execBars = [...asiaExec, ...day.london];
+    const r = simulateTrade({
+      bars: execBars, signalIndex: -1, direction: bias, orderType: 'preComputedFill',
+      precomputedEntryIndex: 0, precomputedEntryPriceRaw: entryPrice,
+      stopPrice: sl, targetPrice: target,
+      exitPlan: { maxHoldingBars: asiaExec.length - 1 }, costModel: COST_MODEL,
+    });
+    if (r.filled) out.push(r);
+  }
+  return out;
+}
+
 // ── Candidate registry: family label -> { tradeFn, grid } ─────────────────
 const DAY_FILTERS = {
   allDays: [0, 1, 2, 3, 4, 5, 6], skipMonday: [0, 2, 3, 4, 5, 6], tueThuOnly: [2, 3, 4],
@@ -500,6 +568,26 @@ const CANDIDATES = {
     fn: tradesFromOrbFailure,
     grid: grid({ confirmBars: [1, 2, 3], targetMultiple: [0.5, 1, 1.5], slBufferPct: [0.05, 0.1], minRangeSize: [0, 60, 100], allowedDaysOfWeek: Object.values(DAY_FILTERS) }),
   },
+  // ── High-win-rate-SHAPE candidates (selectBy: 'winRate') ──────────────
+  // Small target + wide stop structurally raises win rate; the selection
+  // rule maximizes train win rate SUBJECT TO positive train expectancy
+  // after costs, so a config that wins often but loses money can never be
+  // picked. Sessions per operator requirement: Asia, NY premarket/open.
+  asia_fade_scalp: {
+    fn: tradesFromAsiaInternalFade, selectBy: 'winRate',
+    grid: grid({ rangeBars: [2, 3], targetFraction: [0.2, 0.33, 0.5], stopFraction: [0.5, 0.75, 1.0], minRangeSize: [30, 60], allowedDaysOfWeek: [DAY_FILTERS.allDays, DAY_FILTERS.skipMonday] }),
+  },
+  orb_scalp: {
+    fn: tradesFromOrb, selectBy: 'winRate',
+    grid: grid({ rangeHour: [8, 9], targetMultiple: [0.25, 0.33, 0.5], slBufferPct: [0.05, 0.1], minRangeSize: [60, 100], maxHoldHours: [8], allowedDaysOfWeek: Object.values(DAY_FILTERS) }),
+  },
+  fvg_scalp: {
+    fn: tradesFromFvgContinuation, selectBy: 'winRate',
+    // Gap-size floor and Tue/Wed/Thu day filter held fixed at the values
+    // already cross-validated in 5/5 folds for this family; only the
+    // target/stop shape (the win-rate lever) is searched.
+    grid: grid({ targetRMultiple: [0.25, 0.33, 0.5], slBufferPct: [0.1, 0.15, 0.2], minGapSize: [40, 50], maxWaitBars: [10], allowedDaysOfWeek: [[2, 3, 4]] }),
+  },
 };
 
 // Defense in depth: END_OF_DATA trades (the execution array ran out before
@@ -526,10 +614,26 @@ function runWalkForward(label, bars, spec) {
 
     const scored = spec.grid.map(params => {
       const trades = cleanTrades(spec.fn(train, params));
-      return { params, trades: trades.length, avgR: trades.length >= MIN_TRAIN_TRADES ? avgR(trades) : -Infinity };
+      const winRate = trades.length ? trades.filter(t => t.rMultiple > 1e-6).length / trades.length : 0;
+      return { params, trades: trades.length, winRate, avgR: trades.length >= MIN_TRAIN_TRADES ? avgR(trades) : -Infinity };
     }).filter(s => s.trades >= MIN_TRAIN_TRADES);
-    scored.sort((a, b) => b.avgR - a.avgR);
-    const best = scored[0];
+    // Two selection modes, both applied to TRAIN data only:
+    //  - default: maximize expectancy (avgR)
+    //  - 'winRate': maximize win rate SUBJECT TO positive train expectancy
+    //    after costs — encodes the operator's stated objective (highest win
+    //    rate that still makes money) without ever selecting a config that
+    //    wins often but loses money overall. Selecting by win rate alone,
+    //    unconstrained, would happily pick negative-expectancy configs; the
+    //    positivity constraint is what keeps this honest.
+    let best;
+    if (spec.selectBy === 'winRate') {
+      const positive = scored.filter(s => s.avgR > 0);
+      positive.sort((a, b) => b.winRate - a.winRate || b.avgR - a.avgR);
+      best = positive[0];
+    } else {
+      scored.sort((a, b) => b.avgR - a.avgR);
+      best = scored[0];
+    }
     if (!best) { foldResults.push({ fold: f, skipped: true }); continue; }
 
     const testTradesRaw = spec.fn(test, best.params);
