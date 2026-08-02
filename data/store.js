@@ -85,6 +85,66 @@ CREATE TABLE IF NOT EXISTS data_quality_issues (
   bar_time    INTEGER,
   detail      TEXT
 );
+
+-- Complete machine-readable trade ledger (Part 14 artifact). One row per
+-- completed (or missed-limit) simulated trade, from any run — baseline,
+-- research candidate, walk-forward fold, or final holdout. run_id ties each
+-- trade back to its experiments row.
+CREATE TABLE IF NOT EXISTS trades (
+  id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id             TEXT NOT NULL,
+  strategy_id        TEXT NOT NULL,
+  strategy_version   TEXT,
+  symbol             TEXT NOT NULL,
+  session            TEXT,
+  direction          TEXT NOT NULL,
+  order_type         TEXT,
+  filled             INTEGER NOT NULL,
+  missed_reason      TEXT,
+  signal_time        INTEGER,
+  entry_time         INTEGER,
+  entry_price        REAL,
+  stop_price_initial REAL,
+  target_price_initial REAL,
+  exit_time          INTEGER,
+  exit_price         REAL,
+  exit_reason        TEXT,
+  risk_pts           REAL,
+  r_multiple_gross   REAL,
+  r_multiple         REAL,
+  mae_pts            REAL,
+  mfe_pts            REAL,
+  mae_r              REAL,
+  mfe_r              REAL,
+  ambiguous_fill     INTEGER NOT NULL DEFAULT 0,
+  commission_cost_r  REAL,
+  holding_bars       INTEGER,
+  split              TEXT,
+  created_at         INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_trades_run ON trades(run_id);
+CREATE INDEX IF NOT EXISTS idx_trades_strategy_split ON trades(strategy_id, split);
+
+-- Experiment registry (Part 7 requirement). One row per research run —
+-- baseline freeze, a parameter-sweep candidate, a walk-forward fold, a final
+-- holdout — so every reported result traces back to exactly what was run.
+CREATE TABLE IF NOT EXISTS experiments (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id            TEXT UNIQUE NOT NULL,
+  strategy_id       TEXT NOT NULL,
+  strategy_version  TEXT,
+  code_hash         TEXT,
+  dataset_hash      TEXT,
+  data_range        TEXT,
+  instrument        TEXT,
+  session           TEXT,
+  params            TEXT,
+  costs             TEXT,
+  splits            TEXT,
+  results           TEXT,
+  rejection_reason  TEXT,
+  created_at        INTEGER NOT NULL
+);
 `;
 
 class MarketDataStore {
@@ -194,6 +254,66 @@ class MarketDataStore {
 
   distinctSources(symbol, resolution) {
     return this.db.prepare('SELECT DISTINCT source FROM candles WHERE symbol=? AND resolution=?').all(symbol, resolution).map(r => r.source);
+  }
+
+  // trade: a replay_engine.simulateTrade() result, plus { runId, strategyId,
+  // strategyVersion, symbol, session, signalTime, split }.
+  insertTrade(trade) {
+    this.db.prepare(`
+      INSERT INTO trades (run_id, strategy_id, strategy_version, symbol, session, direction, order_type, filled,
+        missed_reason, signal_time, entry_time, entry_price, stop_price_initial, target_price_initial,
+        exit_time, exit_price, exit_reason, risk_pts, r_multiple_gross, r_multiple, mae_pts, mfe_pts,
+        mae_r, mfe_r, ambiguous_fill, commission_cost_r, holding_bars, split, created_at)
+      VALUES (@runId, @strategyId, @strategyVersion, @symbol, @session, @direction, @orderType, @filled,
+        @missedReason, @signalTime, @entryTime, @entryPrice, @stopPriceInitial, @targetPriceInitial,
+        @exitTime, @exitPrice, @exitReason, @riskPts, @rMultipleGross, @rMultiple, @maePts, @mfePts,
+        @maeR, @mfeR, @ambiguousFill, @commissionCostR, @holdingBars, @split, @createdAt)
+    `).run({
+      runId: trade.runId, strategyId: trade.strategyId, strategyVersion: trade.strategyVersion || null,
+      symbol: trade.symbol, session: trade.session || null, direction: trade.direction,
+      orderType: trade.orderType || null, filled: trade.filled ? 1 : 0, missedReason: trade.missedReason || null,
+      signalTime: trade.signalTime ?? null, entryTime: trade.entryTime ?? null, entryPrice: trade.entryPrice ?? null,
+      stopPriceInitial: trade.stopPriceInitial ?? null, targetPriceInitial: trade.targetPriceInitial ?? null,
+      exitTime: trade.exitTime ?? null, exitPrice: trade.exitPrice ?? null, exitReason: trade.exitReason ?? null,
+      riskPts: trade.riskPts ?? null, rMultipleGross: trade.rMultipleGross ?? null, rMultiple: trade.rMultiple ?? null,
+      maePts: trade.maePts ?? null, mfePts: trade.mfePts ?? null, maeR: trade.maeR ?? null, mfeR: trade.mfeR ?? null,
+      ambiguousFill: trade.ambiguousFill ? 1 : 0, commissionCostR: trade.commissionCostR ?? null,
+      holdingBars: trade.holdingBars ?? null, split: trade.split || null, createdAt: Date.now(),
+    });
+  }
+
+  getTrades({ runId, strategyId, split } = {}) {
+    let sql = 'SELECT * FROM trades WHERE 1=1';
+    const params = [];
+    if (runId) { sql += ' AND run_id=?'; params.push(runId); }
+    if (strategyId) { sql += ' AND strategy_id=?'; params.push(strategyId); }
+    if (split) { sql += ' AND split=?'; params.push(split); }
+    sql += ' ORDER BY entry_time ASC';
+    return this.db.prepare(sql).all(...params);
+  }
+
+  insertExperiment(exp) {
+    this.db.prepare(`
+      INSERT INTO experiments (run_id, strategy_id, strategy_version, code_hash, dataset_hash, data_range,
+        instrument, session, params, costs, splits, results, rejection_reason, created_at)
+      VALUES (@runId, @strategyId, @strategyVersion, @codeHash, @datasetHash, @dataRange,
+        @instrument, @session, @params, @costs, @splits, @results, @rejectionReason, @createdAt)
+      ON CONFLICT(run_id) DO UPDATE SET results=excluded.results, rejection_reason=excluded.rejection_reason
+    `).run({
+      runId: exp.runId, strategyId: exp.strategyId, strategyVersion: exp.strategyVersion || null,
+      codeHash: exp.codeHash || null, datasetHash: exp.datasetHash || null, dataRange: exp.dataRange || null,
+      instrument: exp.instrument || null, session: exp.session || null,
+      params: exp.params ? JSON.stringify(exp.params) : null, costs: exp.costs ? JSON.stringify(exp.costs) : null,
+      splits: exp.splits ? JSON.stringify(exp.splits) : null, results: exp.results ? JSON.stringify(exp.results) : null,
+      rejectionReason: exp.rejectionReason || null, createdAt: Date.now(),
+    });
+  }
+
+  getExperiment(runId) {
+    const row = this.db.prepare('SELECT * FROM experiments WHERE run_id=?').get(runId);
+    if (!row) return null;
+    for (const k of ['params', 'costs', 'splits', 'results']) if (row[k]) row[k] = JSON.parse(row[k]);
+    return row;
   }
 
   close() { this.db.close(); }
