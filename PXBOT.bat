@@ -16,6 +16,16 @@ if errorlevel 1 (
   exit /b 1
 )
 
+:: Check Node.js version — the historical-data store needs node:sqlite (Node 22.5+)
+node -e "const [maj,min]=process.versions.node.split('.').map(Number); process.exit((maj>22||(maj===22&&min>=5))?0:1)"
+if errorlevel 1 (
+  echo  Your Node.js version is too old for PXBOT's data store ^(needs 22.5 or newer^).
+  echo  Install a current LTS from https://nodejs.org, then double-click this file again.
+  echo.
+  pause
+  exit /b 1
+)
+
 :: Kill any old instance on port 8899
 for /f "tokens=5" %%a in ('netstat -ano 2^>nul ^| findstr ":8899 "') do (
   taskkill /PID %%a /F >nul 2>&1

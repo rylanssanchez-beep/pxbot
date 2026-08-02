@@ -4,12 +4,22 @@
 // Uses node:sqlite (built into Node 22.5+, no native compile step, no new
 // npm dependency) so the Windows PXBOT.bat launcher — which only runs
 // `npm install` for @modelcontextprotocol/sdk + zod, no build toolchain —
-// keeps working unmodified. Requires Node >= 22.5; server.js should warn,
-// not silently fail, on older Node (see scripts/check_node_version.js).
+// keeps working unmodified. Requires Node >= 22.5; PXBOT.bat checks this
+// before launch, and the require() below fails loudly (not with a cryptic
+// "Cannot find module" stack) on older Node.
 
 const path = require('path');
 const fs = require('fs');
-const { DatabaseSync } = require('node:sqlite');
+
+let DatabaseSync;
+try {
+  ({ DatabaseSync } = require('node:sqlite'));
+} catch (e) {
+  throw new Error(
+    `PXBOT's data store requires node:sqlite, which needs Node.js >= 22.5 (you have ${process.version}). ` +
+    `Install a current Node LTS from https://nodejs.org and re-run. (Original error: ${e.message})`
+  );
+}
 
 const DEFAULT_DB_PATH = path.join(__dirname, 'pxbot_market_data.sqlite');
 
