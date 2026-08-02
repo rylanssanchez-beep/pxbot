@@ -283,6 +283,8 @@ function breakdownBy(trades, keyFn, opts) {
 
   console.log(`\nICT: ${ictTrades.length} trades, ORB: ${orbTrades.length} trades, PREMARKET: ${premarketTrades.length} trades. Total: ${allTrades.length}.`);
 
+  const cleared = store.clearRunTrades(runId);
+  if (cleared) console.log(`Cleared ${cleared} previously-ledgered trades for run_id=${runId} before re-inserting (idempotent re-run).`);
   for (const t of allTrades) store.insertTrade(t);
 
   const hourlySpanDays = (hourlyBars.at(-1).time - hourlyBars[0].time) / 86400;

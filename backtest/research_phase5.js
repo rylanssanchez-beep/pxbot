@@ -324,6 +324,102 @@ function tradesFromPrevDayLevel(bars, params) {
   return out;
 }
 
+// ── Fair Value Gap (FVG) continuation — objective 3-bar imbalance pattern
+// from Part 1/5's own candidate list. Bullish FVG: bar[i-2].high < bar[i].low
+// (a gap nothing traded through). Bearish: bar[i-2].low > bar[i].high. Bet:
+// price retraces INTO the gap and continues in the gap's own direction
+// (the imbalance acts as support/resistance) — a continuation bet, distinct
+// from every reversion/sweep candidate already tested.
+function tradesFromFvgContinuation(bars, params) {
+  const th = { targetRMultiple: 1.5, slBufferPct: 0.1, minGapSize: 20, maxWaitBars: 20, maxHoldBars: 20, allowedDaysOfWeek: [0, 1, 2, 3, 4, 5, 6], ...params };
+  const out = [];
+  for (let i = 2; i < bars.length - 1; i++) {
+    const { dow } = ctParts(bars[i].time);
+    if (!th.allowedDaysOfWeek.includes(dow)) continue;
+    const left = bars[i - 2], right = bars[i];
+    let bias = null, gapLow = null, gapHigh = null;
+    if (left.high < right.low && (right.low - left.high) >= th.minGapSize) { bias = 'LONG'; gapLow = left.high; gapHigh = right.low; }
+    else if (left.low > right.high && (left.low - right.high) >= th.minGapSize) { bias = 'SHORT'; gapLow = right.high; gapHigh = left.low; }
+    if (!bias) continue;
+
+    const forward = bars.slice(i + 1);
+    const scan = forward.slice(0, th.maxWaitBars);
+    let entryIdx = -1, entryPrice = null;
+    for (let k = 0; k < scan.length; k++) {
+      const b = scan[k];
+      const touchedGap = b.low <= gapHigh && b.high >= gapLow; // range overlap — direction-agnostic
+      if (touchedGap) { entryIdx = k; entryPrice = bias === 'LONG' ? Math.min(gapHigh, b.high) : Math.max(gapLow, b.low); break; }
+    }
+    if (entryIdx === -1) continue;
+
+    const gapSize = gapHigh - gapLow;
+    const sl = bias === 'LONG' ? gapLow - gapSize * th.slBufferPct : gapHigh + gapSize * th.slBufferPct;
+    const risk = Math.abs(entryPrice - sl);
+    if (!(risk > 0)) continue;
+    const target = bias === 'LONG' ? entryPrice + risk * th.targetRMultiple : entryPrice - risk * th.targetRMultiple;
+
+    const r = simulateTrade({
+      bars: forward, signalIndex: entryIdx - 1, direction: bias, orderType: 'preComputedFill',
+      precomputedEntryIndex: entryIdx, precomputedEntryPriceRaw: entryPrice,
+      stopPrice: sl, targetPrice: target, exitPlan: { maxHoldingBars: th.maxHoldBars }, costModel: COST_MODEL,
+    });
+    if (r.filled) out.push(r);
+  }
+  return out;
+}
+
+// ── Opening-range failure (fade) — the direct complement to ORB: when the
+// hourly opening-range breaks out but FAILS (price re-enters the range
+// within a short confirm window instead of continuing), fade back toward
+// the opposite side. Reuses orb_engine.js's own range-bar/sliceByDate so the
+// range definition is identical to ORB's — only the bet (fade vs.
+// continuation) differs, isolating that one variable.
+function tradesFromOrbFailure(bars, params) {
+  const th = { ...orbEngine.DEFAULT_ORB, confirmBars: 2, targetMultiple: 1, ...params };
+  const byDate = orbEngine.sliceByDate(bars, th);
+  const out = [];
+  for (const [date, entry] of byDate.entries()) {
+    if (!entry.rangeBar || !entry.forward.length) continue;
+    if (!th.allowedDaysOfWeek.includes(entry.dow)) continue;
+    const size = entry.rangeBar.high - entry.rangeBar.low;
+    if (size <= 0 || size < th.minRangeSize) continue;
+    const scan = entry.forward.slice(0, th.maxHoldHours);
+
+    let breakoutIdx = -1, breakoutBias = null;
+    for (let i = 0; i < scan.length; i++) {
+      const b = scan[i];
+      if (b.high > entry.rangeBar.high) { breakoutBias = 'LONG'; breakoutIdx = i; break; }
+      if (b.low < entry.rangeBar.low) { breakoutBias = 'SHORT'; breakoutIdx = i; break; }
+    }
+    if (breakoutIdx === -1) continue;
+
+    // Confirmation: within confirmBars, price must close back INSIDE the range (a failed breakout).
+    const confirmWindow = scan.slice(breakoutIdx, breakoutIdx + th.confirmBars);
+    let failIdx = -1, entryPrice = null;
+    for (let k = 0; k < confirmWindow.length; k++) {
+      const cb = confirmWindow[k];
+      const closedBackIn = breakoutBias === 'LONG' ? cb.close < entry.rangeBar.high : cb.close > entry.rangeBar.low;
+      if (closedBackIn) { failIdx = breakoutIdx + k; entryPrice = cb.close; break; }
+    }
+    if (failIdx === -1) continue; // breakout held — not a failure, no trade (that's ORB's territory, not this candidate's)
+
+    const fadeBias = breakoutBias === 'LONG' ? 'SHORT' : 'LONG'; // fade the failed direction
+    const sl = fadeBias === 'SHORT' ? entry.rangeBar.high + size * th.slBufferPct : entry.rangeBar.low - size * th.slBufferPct;
+    const mid = (entry.rangeBar.high + entry.rangeBar.low) / 2;
+    const risk = Math.abs(entryPrice - sl);
+    if (!(risk > 0)) continue;
+    const target = fadeBias === 'LONG' ? entryPrice + risk * th.targetMultiple : entryPrice - risk * th.targetMultiple;
+
+    const r = simulateTrade({
+      bars: entry.forward, signalIndex: -1, direction: fadeBias, orderType: 'preComputedFill',
+      precomputedEntryIndex: failIdx, precomputedEntryPriceRaw: entryPrice,
+      stopPrice: sl, targetPrice: target, exitPlan: { maxHoldingBars: th.maxHoldHours }, costModel: COST_MODEL,
+    });
+    if (r.filled) out.push(r);
+  }
+  return out;
+}
+
 // ── Candidate registry: family label -> { tradeFn, grid } ─────────────────
 const DAY_FILTERS = {
   allDays: [0, 1, 2, 3, 4, 5, 6], skipMonday: [0, 2, 3, 4, 5, 6], tueThuOnly: [2, 3, 4],
@@ -380,6 +476,14 @@ const CANDIDATES = {
   prev_day_level: {
     fn: tradesFromPrevDayLevel,
     grid: grid({ targetMultiple: [0.5, 1, 1.5], slBufferPct: [0.05, 0.1], minRangeSize: [0, 100], maxHoldBars: [6, 12], allowedDaysOfWeek: Object.values(DAY_FILTERS) }),
+  },
+  fvg_continuation: {
+    fn: tradesFromFvgContinuation,
+    grid: grid({ targetRMultiple: [1, 1.5, 2], slBufferPct: [0.05, 0.1, 0.15], minGapSize: [10, 20, 40], maxWaitBars: [10, 20], allowedDaysOfWeek: Object.values(DAY_FILTERS) }),
+  },
+  orb_failure_fade: {
+    fn: tradesFromOrbFailure,
+    grid: grid({ confirmBars: [1, 2, 3], targetMultiple: [0.5, 1, 1.5], slBufferPct: [0.05, 0.1], minRangeSize: [0, 60, 100], allowedDaysOfWeek: Object.values(DAY_FILTERS) }),
   },
 };
 
@@ -516,7 +620,12 @@ function runWalkForward(label, bars, spec) {
     });
 
     // Ledger every walk-forward OOS trade and the holdout trades, for accepted AND rejected candidates —
-    // the mission requires a complete ledger, not just winners.
+    // the mission requires a complete ledger, not just winners. Clear this
+    // run_id's rows first so re-running a candidate (e.g. after a bug fix or
+    // a wider grid) REPLACES its ledger entries instead of appending
+    // duplicates on top of a stale, superseded set.
+    const clearedN = store.clearRunTrades(runId);
+    if (clearedN) console.log(`  (cleared ${clearedN} previously-ledgered trades for ${runId} before re-inserting)`);
     for (const fold of r.rawFolds) {
       for (const t of (fold.testTrades || [])) {
         store.insertTrade({ ...t, runId, strategyId: label, strategyVersion: 'v1', symbol: SYMBOL, session: label, split: `walkforward_fold${fold.fold}` });

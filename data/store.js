@@ -256,6 +256,13 @@ class MarketDataStore {
     return this.db.prepare('SELECT DISTINCT source FROM candles WHERE symbol=? AND resolution=?').all(symbol, resolution).map(r => r.source);
   }
 
+  // Call before re-inserting a run's trades so re-running the same script
+  // (e.g. while iterating on a bug fix) REPLACES that run's ledger rows
+  // instead of silently appending duplicates on top of them.
+  clearRunTrades(runId) {
+    return this.db.prepare('DELETE FROM trades WHERE run_id=?').run(runId).changes;
+  }
+
   // trade: a replay_engine.simulateTrade() result, plus { runId, strategyId,
   // strategyVersion, symbol, session, signalTime, split }.
   insertTrade(trade) {
