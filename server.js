@@ -628,8 +628,12 @@ async function computeSignalConfirmation(ict, orb, quote, hourlyBars) {
     ? { low: ict.levels.oteLow, high: ict.levels.oteHigh }
     : (() => { const size = orb.rangeBar.high - orb.rangeBar.low; return { low: Math.min(orb.entry, orb.entry - size * 0.1), high: Math.max(orb.entry, orb.entry + size * 0.1) }; })();
 
-  const recentExecution = hourlyBars.slice(-200);
-  const [m5, m15, h4data, d1data] = await Promise.all([
+  // m1 is the TRUE execution timeframe — this account enters/exits on the
+  // 1-minute chart, not hourly. Hourly bars stay in barsByTF as "key levels"
+  // MTF context (matching the directive's Monthly/Weekly/Daily/4H/1H/15M/5M/
+  // Execution list) but no longer stand in for the execution timeframe.
+  const [m1data, m5, m15, h4data, d1data] = await Promise.all([
+    loopbackGet('/api/candles?resolution=1&count=1000'),
     loopbackGet('/api/candles?resolution=5&count=300'),
     loopbackGet('/api/candles?resolution=15&count=300'),
     loopbackGet('/api/candles?resolution=240&count=500'),
@@ -637,15 +641,20 @@ async function computeSignalConfirmation(ict, orb, quote, hourlyBars) {
   ]);
   const daily = (d1data.bars && d1data.bars.length) ? d1data.bars : hourlyToDaily(hourlyBars);
   const h4 = (h4data.bars && h4data.bars.length) ? h4data.bars : hourlyToH4(hourlyBars);
+  // m1 falls back to the hourly series (still better than nothing) only if
+  // the 1-minute feed genuinely returned nothing — this account's feed has
+  // real 1m depth (verified: 200k+ bars over ~200 days via fetch_deep.js),
+  // so this fallback should not normally trigger live.
+  const executionBars = (m1data.bars && m1data.bars.length >= 60) ? m1data.bars.slice(-1000) : hourlyBars.slice(-200);
   const barsByTF = {
-    m5: m5.bars || [], m15: m15.bars || [], h1: recentExecution, h4, d1: daily,
+    m1: executionBars, m5: m5.bars || [], m15: m15.bars || [], h1: hourlyBars.slice(-200), h4, d1: daily,
     weekly: fractalEngine.aggregateToTimeframe(daily, 'week'),
     monthly: fractalEngine.aggregateToTimeframe(daily, 'month'),
   };
 
   const weights = loadConfirmationWeights();
   const report = confirmationEngine.computeConfirmation({
-    bias, quote, entryZone, executionBars: recentExecution, barsByTF,
+    bias, quote, entryZone, executionBars, barsByTF,
     ictResult: ictFired ? { bias: ict.bias } : null,
     orbResult: orbFired ? { bias: orb.bias } : null,
   }, weights);

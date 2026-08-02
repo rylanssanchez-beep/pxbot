@@ -21,8 +21,13 @@ const fractalEngine = require('./fractal_engine');
 // resolutions (confirmed in server.js's zod enum for the MCP tool) — no
 // native weekly/monthly, so those two are built by aggregating daily bars.
 async function fetchMTFBars(loopbackGet, opts = {}) {
-  const counts = { m5: 500, m15: 500, h1: 2000, h4: 1000, d1: 500, ...(opts.counts || {}) };
-  const [m5, m15, h1, h4, d1] = await Promise.all([
+  // m1 is the TRUE execution timeframe — this account's actual entries/exits
+  // happen on the 1-minute chart, not hourly. m5 through monthly are the
+  // higher-timeframe "key levels" context. Together these are the 8
+  // timeframes the directive lists: Monthly/Weekly/Daily/4H/1H/15M/5M/Execution.
+  const counts = { m1: 1000, m5: 500, m15: 500, h1: 2000, h4: 1000, d1: 500, ...(opts.counts || {}) };
+  const [m1, m5, m15, h1, h4, d1] = await Promise.all([
+    loopbackGet(`/api/candles?resolution=1&count=${counts.m1}`),
     loopbackGet(`/api/candles?resolution=5&count=${counts.m5}`),
     loopbackGet(`/api/candles?resolution=15&count=${counts.m15}`),
     loopbackGet(`/api/candles?resolution=60&count=${counts.h1}`),
@@ -31,7 +36,7 @@ async function fetchMTFBars(loopbackGet, opts = {}) {
   ]);
   const daily = d1.bars || [];
   return {
-    m5: m5.bars || [], m15: m15.bars || [], h1: h1.bars || [], h4: h4.bars || [],
+    m1: m1.bars || [], m5: m5.bars || [], m15: m15.bars || [], h1: h1.bars || [], h4: h4.bars || [],
     d1: daily,
     weekly: fractalEngine.aggregateToTimeframe(daily, 'week'),
     monthly: fractalEngine.aggregateToTimeframe(daily, 'month'),
