@@ -33,6 +33,7 @@ const trendPullback = require('./trend_pullback_engine');
 const vwapReversion = require('./vwap_reversion_engine');
 const liquiditySweep = require('./liquidity_sweep_engine');
 const sessionReversion = require('./session_reversion_engine');
+const orbEngine = require('./orb_engine');
 const sessionBreakout = require('./session_breakout_engine');
 
 const SYMBOL = 'NAS100';
@@ -228,6 +229,91 @@ function tradesFromSessionBreakout(bars, params) {
   return out;
 }
 
+// ── ORB refinement: same mechanism as the frozen baseline (breakout of an
+// hourly range bar) but with a wider parameter grid — different range-
+// defining hour, target multiple, stop buffer, day filters — to see if a
+// BETTER-tuned ORB variant exists, tested through the identical walk-
+// forward + holdout discipline as every other candidate here, not swapped
+// into the live config without validation.
+function tradesFromOrb(bars, params) {
+  const th = { ...orbEngine.DEFAULT_ORB, ...params };
+  const byDate = orbEngine.sliceByDate(bars, th);
+  const out = [];
+  for (const [date, entry] of byDate.entries()) {
+    if (!entry.rangeBar || !entry.forward.length) continue;
+    if (!th.allowedDaysOfWeek.includes(entry.dow)) continue;
+    const size = entry.rangeBar.high - entry.rangeBar.low;
+    if (size <= 0 || size < th.minRangeSize) continue;
+    const scan = entry.forward.slice(0, th.maxHoldHours);
+    let bias = null, entryIdx = -1, entryPriceRaw = null;
+    for (let i = 0; i < scan.length; i++) {
+      const b = scan[i];
+      if (b.high > entry.rangeBar.high) { bias = 'LONG'; entryPriceRaw = entry.rangeBar.high; entryIdx = i; break; }
+      if (b.low < entry.rangeBar.low) { bias = 'SHORT'; entryPriceRaw = entry.rangeBar.low; entryIdx = i; break; }
+    }
+    if (!bias) continue;
+    const sl = bias === 'LONG' ? entry.rangeBar.low - size * th.slBufferPct : entry.rangeBar.high + size * th.slBufferPct;
+    const target = bias === 'LONG' ? entryPriceRaw + size * th.targetMultiple : entryPriceRaw - size * th.targetMultiple;
+    const r = simulateTrade({
+      bars: entry.forward, signalIndex: -1, direction: bias, orderType: 'preComputedFill',
+      precomputedEntryIndex: entryIdx, precomputedEntryPriceRaw: entryPriceRaw,
+      stopPrice: sl, targetPrice: target, exitPlan: { maxHoldingBars: th.maxHoldHours }, costModel: COST_MODEL,
+    });
+    if (r.filled) out.push(r);
+  }
+  return out;
+}
+
+// ── Previous-day high/low breakout — a new family (Part 5's own list:
+// "Previous day high and low"), not tested in round 1/2. Objective,
+// mechanically distinct from ORB (prior CALENDAR DAY's full range, not a
+// single opening hour): once NY regular hours begin, the first break of
+// yesterday's high or low is traded as continuation.
+function ctParts(unixSecs) {
+  const d = new Date(new Date(unixSecs * 1000).toLocaleString('en-US', { timeZone: 'America/Chicago' }));
+  return { hour: d.getHours() + d.getMinutes() / 60, dateKey: d.toISOString().slice(0, 10), dow: d.getDay() };
+}
+function tradesFromPrevDayLevel(bars, params) {
+  const th = { targetMultiple: 1, slBufferPct: 0.1, minRangeSize: 0, maxHoldBars: 12, allowedDaysOfWeek: [0, 1, 2, 3, 4, 5, 6], ...params };
+  const byDate = new Map();
+  for (const b of bars) {
+    const { hour, dateKey, dow } = ctParts(b.time);
+    if (!byDate.has(dateKey)) byDate.set(dateKey, { all: [], nyOpen: [], dow });
+    const day = byDate.get(dateKey);
+    day.all.push(b);
+    if (hour >= 9.5 && hour < 15) day.nyOpen.push(b);
+  }
+  const dateKeys = [...byDate.keys()].sort();
+  const out = [];
+  for (let i = 1; i < dateKeys.length; i++) {
+    const today = byDate.get(dateKeys[i]);
+    const yesterday = byDate.get(dateKeys[i - 1]);
+    if (!today.nyOpen.length || !yesterday.all.length) continue;
+    if (!th.allowedDaysOfWeek.includes(today.dow)) continue;
+    const prevHigh = Math.max(...yesterday.all.map(b => b.high));
+    const prevLow = Math.min(...yesterday.all.map(b => b.low));
+    const size = prevHigh - prevLow;
+    if (size <= 0 || size < th.minRangeSize) continue;
+    const scan = today.nyOpen.slice(0, th.maxHoldBars);
+    let bias = null, entryIdx = -1, entryPrice = null;
+    for (let k = 0; k < scan.length; k++) {
+      const b = scan[k];
+      if (b.high > prevHigh) { bias = 'LONG'; entryPrice = prevHigh; entryIdx = k; break; }
+      if (b.low < prevLow) { bias = 'SHORT'; entryPrice = prevLow; entryIdx = k; break; }
+    }
+    if (!bias) continue;
+    const sl = bias === 'LONG' ? prevLow - size * th.slBufferPct : prevHigh + size * th.slBufferPct;
+    const target = bias === 'LONG' ? entryPrice + size * th.targetMultiple : entryPrice - size * th.targetMultiple;
+    const r = simulateTrade({
+      bars: today.nyOpen, signalIndex: -1, direction: bias, orderType: 'preComputedFill',
+      precomputedEntryIndex: entryIdx, precomputedEntryPriceRaw: entryPrice,
+      stopPrice: sl, targetPrice: target, exitPlan: { maxHoldingBars: today.nyOpen.length }, costModel: COST_MODEL,
+    });
+    if (r.filled) out.push(r);
+  }
+  return out;
+}
+
 // ── Candidate registry: family label -> { tradeFn, grid } ─────────────────
 const DAY_FILTERS = {
   allDays: [0, 1, 2, 3, 4, 5, 6], skipMonday: [0, 2, 3, 4, 5, 6], tueThuOnly: [2, 3, 4],
@@ -276,6 +362,14 @@ const CANDIDATES = {
   session_breakout_london: {
     fn: tradesFromSessionBreakout,
     grid: grid({ anchor: ['london'], targetMultiple: [0.5, 1, 1.5], slBufferPct: [0.05, 0.1], minRangeSize: [0, 60], allowedDaysOfWeek: Object.values(DAY_FILTERS), minTrendEfficiency: [0, 0.3, 0.4, 0.5], regimeLookback: [20] }),
+  },
+  orb_refine: {
+    fn: tradesFromOrb,
+    grid: grid({ rangeHour: [7, 8, 9, 10], targetMultiple: [0.5, 1, 1.5, 2], slBufferPct: [0.05, 0.1, 0.15], minRangeSize: [0, 60, 100], maxHoldHours: [8], allowedDaysOfWeek: Object.values(DAY_FILTERS) }),
+  },
+  prev_day_level: {
+    fn: tradesFromPrevDayLevel,
+    grid: grid({ targetMultiple: [0.5, 1, 1.5], slBufferPct: [0.05, 0.1], minRangeSize: [0, 100], maxHoldBars: [6, 12], allowedDaysOfWeek: Object.values(DAY_FILTERS) }),
   },
 };
 
@@ -375,7 +469,18 @@ function runWalkForward(label, bars, spec) {
     const r = runWalkForward(label, hourlyBars, spec);
     results[label] = r;
     console.log(`  Walk-forward: ${r.verdict.positiveFolds}/${r.verdict.validFolds} folds profitable OOS, ${r.verdict.uniqueConfigs} distinct configs (most common repeated ${r.verdict.mostCommonCount}x), combined OOS avgR=${r.verdict.combinedOosAvgR} (n=${r.verdict.combinedOosTrades})`);
-    if (r.holdout) console.log(`  Final holdout: n=${r.holdout.n}, avgR=${r.holdout.avgR}`);
+
+    // Full stats (wins/losses/win rate/RR), as requested — computed from the
+    // SAME combined-OOS + holdout trade set the verdict itself used, never a
+    // different, more-flattering slice.
+    const allOosTrades = r.rawFolds.flatMap(f => f.testTrades || []);
+    const oosMetrics = computeMetrics(allOosTrades, {});
+    console.log(`  OOS stats: n=${oosMetrics.totalTrades}, wins=${oosMetrics.wins}, losses=${oosMetrics.losses}, winRate=${oosMetrics.winRatePct}%, avgWin=${oosMetrics.avgWinR}R, avgLoss=${oosMetrics.avgLossR}R, RR(payoff)=${oosMetrics.payoffRatio}, expectancy=${oosMetrics.expectancyR}R, PF=${oosMetrics.profitFactor}`);
+
+    if (r.holdout) {
+      const holdoutMetrics = computeMetrics(r.holdout.trades, {});
+      console.log(`  Final holdout: n=${holdoutMetrics.totalTrades}, wins=${holdoutMetrics.wins}, losses=${holdoutMetrics.losses}, winRate=${holdoutMetrics.winRatePct}%, RR(payoff)=${holdoutMetrics.payoffRatio}, expectancy=${holdoutMetrics.expectancyR}R`);
+    }
     console.log(`  VERDICT: ${r.accepted ? 'ACCEPTED' : 'REJECTED — ' + r.rejectionReason}\n`);
 
     const runId = `phase5_${label}`;
