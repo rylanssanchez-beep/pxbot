@@ -14,7 +14,7 @@
 
 function ctParts(unixSecs) {
   const d = new Date(new Date(unixSecs * 1000).toLocaleString('en-US', { timeZone: 'America/Chicago' }));
-  return { hour: d.getHours() + d.getMinutes() / 60, dateKey: d.toISOString().slice(0, 10) };
+  return { hour: d.getHours() + d.getMinutes() / 60, dateKey: d.toISOString().slice(0, 10), dow: d.getDay() };
 }
 
 // The expensive part (toLocaleString per bar) doesn't depend on rangeHour —
@@ -34,14 +34,24 @@ const DEFAULT_ORB = {
   slBufferPct: 0.05,  // stop sits this fraction of range size beyond the opposite side
   minRangeSize: 0,    // points — skip tiny/noisy ranges (selectivity)
   maxHoldHours: 8,    // give up (timeout) after this many bars past the range hour
+  // Day-of-week gating, same convention as ict_engine.js's allowedDaysOfWeek
+  // (0=Sun..6=Sat, CT date of the range bar). Defaults to every day, i.e.
+  // identical to this module's behavior before this option existed — ICT
+  // already had this lever, ORB never did. Real evidence (146 trades at 1m
+  // execution granularity, backtest/confirmation_backtest_finegrain.js)
+  // showed Monday dragging combined performance hard (avgR -0.275, n=25,
+  // 28% win rate) versus Tue/Thu (+0.091/+0.042, 60%+ win rate) — this
+  // option exists to let that evidence actually be tested, not to assert
+  // Monday should be skipped by default.
+  allowedDaysOfWeek: [0, 1, 2, 3, 4, 5, 6],
 };
 
 // Groups bars by date; each date gets { rangeBar, breakoutCandidates (bars after the range hour, same day, through afterhours) }.
 function sliceByDate(bars, opts) {
   const parts = ctPartsForAll(bars);
   const byDate = new Map();
-  for (const { bar: b, hour, dateKey } of parts) {
-    if (!byDate.has(dateKey)) byDate.set(dateKey, { rangeBar: null, forward: [] });
+  for (const { bar: b, hour, dateKey, dow } of parts) {
+    if (!byDate.has(dateKey)) byDate.set(dateKey, { rangeBar: null, forward: [], dow });
     const entry = byDate.get(dateKey);
     if (Math.floor(hour) === opts.rangeHour) entry.rangeBar = b;
     else if (hour > opts.rangeHour && hour < 19) entry.forward.push(b); // through NY + afterhours, before next Asia
@@ -83,6 +93,7 @@ function runOrbBacktest(bars, opts = {}) {
   const days = [];
   for (const [date, entry] of byDate.entries()) {
     if (!entry.rangeBar || !entry.forward.length) continue;
+    if (!th.allowedDaysOfWeek.includes(entry.dow)) continue;
     const sim = simulateOrbDay(entry.rangeBar, entry.forward, th);
     if (!sim) continue;
     days.push({ date, ...sim });

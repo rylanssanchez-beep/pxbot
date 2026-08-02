@@ -268,13 +268,15 @@ const VARIANTS = {
     const filtered = trades.filter(t => Math.abs(t.legHigh - t.legLow) >= minLeg);
     const splitIdx = Math.ceil(filtered.length * 0.6);
     const train = filtered.slice(0, splitIdx), test = filtered.slice(splitIdx);
-    const score = arr => {
+    const score = (arr, variantName) => {
       let r = 0, n = 0;
-      for (const t of arr) { const res = VARIANTS.partial_adaptive(t.bias, t.levels, t.entryPrice, t.forwardBars); if (!res) continue; n++; r += res.r; }
+      for (const t of arr) { const res = VARIANTS[variantName](t.bias, t.levels, t.entryPrice, t.forwardBars, t.legLow, t.legHigh); if (!res) continue; n++; r += res.r; }
       return { n, totalR: +r.toFixed(2), avgR: n ? +(r / n).toFixed(3) : null };
     };
-    const trainScore = score(train), testScore = score(test);
-    console.log(`  minLeg>=${minLeg}pt: TRAIN ${JSON.stringify(trainScore)} [${train[0]?.date} -> ${train[train.length-1]?.date}]`);
-    console.log(`  minLeg>=${minLeg}pt: TEST  ${JSON.stringify(testScore)} [${test[0]?.date} -> ${test[test.length-1]?.date}] (never used to pick this filter)`);
+    for (const variantName of ['partial_adaptive', 'breakeven_ladder']) {
+      const trainScore = score(train, variantName), testScore = score(test, variantName);
+      console.log(`  minLeg>=${minLeg}pt [${variantName}]: TRAIN ${JSON.stringify(trainScore)} [${train[0]?.date} -> ${train[train.length-1]?.date}]`);
+      console.log(`  minLeg>=${minLeg}pt [${variantName}]: TEST  ${JSON.stringify(testScore)} [${test[0]?.date} -> ${test[test.length-1]?.date}] (never used to pick this filter)`);
+    }
   }
 })().catch(e => { console.error('Failed:', e.message); process.exit(1); });
