@@ -59,6 +59,12 @@ const DEFAULT_THRESHOLDS = {
   minRangeSize: 0,
   maxHoldBars: 40,           // forward BARS (hourly), not hours — generous since some anchors (asia) leave a long forward window
   allowedDaysOfWeek: [0, 1, 2, 3, 4, 5, 6],
+  minTrendEfficiency: 0,     // 0 = no filter (unchanged behavior). >0 requires engine/regime_engine's
+                             // efficiency ratio, measured on the bars leading INTO the anchor session,
+                             // to clear this bar before the breakout is even considered — a breakout/
+                             // continuation bet only makes sense when the market already has momentum
+                             // going into the range, same rationale as trend_pullback_engine.js.
+  regimeLookback: 20,        // bars fed to the efficiency-ratio calc when minTrendEfficiency > 0
 };
 
 // Which session buckets count as "forward" (breakout candidates) after each anchor.
@@ -105,10 +111,31 @@ function runSessionBreakoutBacktest(bars, opts = {}) {
   const forwardBuckets = FORWARD_AFTER[th.anchor];
   if (!forwardBuckets) throw new Error(`Unknown anchor: ${th.anchor}`);
 
+  // Only built (and only pays the cost) when the regime filter is actually
+  // in use — global time->index lookup so we can pull the trailing window
+  // of bars leading INTO the anchor session for each day without lookahead.
+  let timeToIndex = null;
+  let regimeEngine = null;
+  if (th.minTrendEfficiency > 0) {
+    regimeEngine = require('../engine/regime_engine');
+    timeToIndex = new Map();
+    for (let i = 0; i < bars.length; i++) timeToIndex.set(bars[i].time, i);
+  }
+
   for (const [date, sess] of byDate.entries()) {
     if (!th.allowedDaysOfWeek.includes(sess.dow)) continue;
     const anchorBars = sess[th.anchor];
     if (!anchorBars || !anchorBars.length) continue;
+
+    if (th.minTrendEfficiency > 0) {
+      const lastAnchorBar = anchorBars[anchorBars.length - 1];
+      const idx = timeToIndex.get(lastAnchorBar.time);
+      if (idx === undefined) continue;
+      const regimeWindow = bars.slice(Math.max(0, idx + 1 - th.regimeLookback), idx + 1);
+      const regime = regimeEngine.classifyRegime(regimeWindow, { ...regimeEngine.DEFAULT_THRESHOLDS, erLookback: th.regimeLookback });
+      if (regime.efficiencyRatio === null || regime.efficiencyRatio < th.minTrendEfficiency) continue;
+    }
+
     const range = rangeOf(anchorBars);
     if (!range) continue;
     const forward = forwardBuckets.flatMap(k => sess[k] || []);
