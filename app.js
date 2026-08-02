@@ -2844,6 +2844,20 @@ async function runAISignal() {
     const ictFired = ict && ict.bias !== 'WAIT';
     const orbFired = orb && orb.bias !== 'WAIT';
 
+    // Confirmation engine (server.js:computeSignalConfirmation) — additive
+    // context only, does not change ict/orb above. Falls back to the
+    // original null/false behavior if a server without this field is ever
+    // hit, so this stays backward compatible.
+    const conf = (sig.confirmation && !sig.confirmation.error) ? sig.confirmation : null;
+    const factorAgrees = name => !!conf?.factors?.find(f => f.name === name && f.agrees === true);
+    const confFields = conf ? {
+      confidence: conf.confidence,
+      confluence_score: `${conf.tier} · ${conf.confidence}% (${conf.agreeingCount} of ${conf.factors.length - (conf.factors.filter(f=>f.excluded).length)} confirmations agree)`,
+      order_block_in_ote: factorAgrees('orderBlockConfluence'),
+      fvg_in_ote: factorAgrees('fvgConfluence'),
+      premium_discount_aligned: factorAgrees('dailyPricePosition') || factorAgrees('mtfFractalAlignment'),
+    } : { confidence: null, confluence_score: null, order_block_in_ote: false, fvg_in_ote: false, premium_discount_aligned: false };
+
     let json;
     if (ictFired) {
       const lv = ict.levels;
@@ -2858,8 +2872,9 @@ async function runAISignal() {
         tp1: lv.tp1, tp2: lv.tp2, tp3: lv.tp3,
         tp1_pts: +Math.abs(lv.tp1 - entryMid).toFixed(2), tp2_pts: +Math.abs(lv.tp2 - entryMid).toFixed(2), tp3_pts: +Math.abs(lv.tp3 - entryMid).toFixed(2),
         rr: +(Math.abs(lv.tp2 - entryMid) / Math.max(0.25, risk)).toFixed(1),
-        confidence: null,
-        reasoning: `Validated ICT leg-filter engine: ${ict.reason}. Track record: ${ict.trackRecord}` + (orbFired ? ` [ORB also fired this bar — see below]` : ''),
+        ...confFields,
+        reasoning: `Validated ICT leg-filter engine: ${ict.reason}. Track record: ${ict.trackRecord}` + (orbFired ? ` [ORB also fired this bar — see below]` : '')
+          + (conf ? ` | Confirmation engine: ${conf.tier} tier, ${conf.confidence}% confidence (${conf.agreeingCount} agree / ${conf.disagreeingCount} disagree) — context only, not a live-validated gate yet.` : ''),
         invalidation: lv.sl,
       };
     } else if (orbFired) {
@@ -2873,8 +2888,9 @@ async function runAISignal() {
         tp1: 0, tp2: orb.target, tp3: 0,
         tp1_pts: 0, tp2_pts: +Math.abs(orb.target - orb.entry).toFixed(2), tp3_pts: 0,
         rr: +(Math.abs(orb.target - orb.entry) / Math.max(0.25, risk)).toFixed(1),
-        confidence: null,
-        reasoning: `Validated ORB engine: breakout of the opening range. Track record: ${orb.trackRecord}`,
+        ...confFields,
+        reasoning: `Validated ORB engine: breakout of the opening range. Track record: ${orb.trackRecord}`
+          + (conf ? ` | Confirmation engine: ${conf.tier} tier, ${conf.confidence}% confidence (${conf.agreeingCount} agree / ${conf.disagreeingCount} disagree) — context only, not a live-validated gate yet.` : ''),
         invalidation: orb.sl,
       };
     } else {
@@ -2917,6 +2933,23 @@ function applyAISignal(json) {
   state.fibLow     = low;
   state.fibBias    = bias === 'WAIT' ? 'WAIT' : bias;
   state.scenarioId = id;
+
+  // Confirmation-engine confidence bar (engine/confirmation_engine.js, via
+  // server.js:computeSignalConfirmation) — was permanently hidden before
+  // since confidence was always hardcoded null; now shows the real score
+  // when the server provides one, hidden otherwise (backward compatible).
+  const confEl = $('aiConfidence');
+  if (confEl) {
+    const confidence = Number(json.confidence);
+    if (json.confidence !== null && json.confidence !== undefined && !Number.isNaN(confidence)) {
+      confEl.style.display = 'flex';
+      const fillEl = $('confFill'), pctEl = $('confPct');
+      if (fillEl) fillEl.style.width = Math.max(0, Math.min(100, confidence)) + '%';
+      if (pctEl) pctEl.textContent = confidence.toFixed(0) + '%';
+    } else {
+      confEl.style.display = 'none';
+    }
+  }
 
   // Scenario panel
   const sName = json.scenario_name || (SCENARIOS[id] ? SCENARIOS[id].name : 'AI Signal');
