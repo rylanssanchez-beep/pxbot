@@ -13,9 +13,19 @@
 
 const regimeEngine = require('../engine/regime_engine');
 
-function ctParts(unixSecs) {
-  const d = new Date(new Date(unixSecs * 1000).toLocaleString('en-US', { timeZone: 'America/Chicago' }));
-  return { dateKey: d.toISOString().slice(0, 10), dow: d.getDay() };
+// toLocaleString with a timeZone is expensive (same lesson already learned
+// in orb_engine.js/ict_engine.js/confirmation_backtest.js) — this function
+// gets called on every bar, potentially multiple times each, across a
+// ~14,000-bar grid-searched backtest, so cache by bar object identity.
+const _ctPartsCache = new WeakMap();
+function ctParts(bar) {
+  let parts = _ctPartsCache.get(bar);
+  if (parts === undefined) {
+    const d = new Date(new Date(bar.time * 1000).toLocaleString('en-US', { timeZone: 'America/Chicago' }));
+    parts = { dateKey: d.toISOString().slice(0, 10), dow: d.getDay() };
+    _ctPartsCache.set(bar, parts);
+  }
+  return parts;
 }
 
 const DEFAULT_THRESHOLDS = {
@@ -58,7 +68,7 @@ function sessionVwapSeries(bars) {
   let cumPV = 0, cumVol = 0, curDate = null;
   for (let i = 0; i < bars.length; i++) {
     const b = bars[i];
-    const dateKey = ctParts(b.time).dateKey;
+    const dateKey = ctParts(b).dateKey;
     if (dateKey !== curDate) { curDate = dateKey; cumPV = 0; cumVol = 0; }
     const typical = (b.high + b.low + b.close) / 3;
     const vol = b.volume || 1; // fall back to 1 (equal-weighted average) if volume is missing/zero, rather than dividing by zero
@@ -78,13 +88,18 @@ function runVwapReversionBacktest(bars, opts = {}) {
   let i = Math.max(th.atrPeriod, th.minRegimeBars, th.lookbackForExtreme);
   while (i < bars.length) {
     const b = bars[i];
-    const { dow } = ctParts(b.time);
+    const { dow } = ctParts(b);
     if (!th.allowedDaysOfWeek.includes(dow) || !atr[i] || !vwap[i]) { i++; continue; }
 
     const deviation = (b.close - vwap[i]) / atr[i];
     if (Math.abs(deviation) < th.deviationAtrMultiple) { i++; continue; }
 
-    const regime = regimeEngine.classifyRegime(bars.slice(0, i + 1).slice(-th.regimeLookback - 5), { ...regimeEngine.DEFAULT_THRESHOLDS, erLookback: th.regimeLookback });
+    // Bounded trailing window directly — bars.slice(0, i+1).slice(-N) would
+    // materialize an O(i)-sized array just to throw away everything but the
+    // last N elements, on every candidate bar (the same O(n^2) mistake
+    // already fixed twice elsewhere this session in confirmations.js).
+    const regimeWindow = bars.slice(Math.max(0, i + 1 - (th.regimeLookback + 5)), i + 1);
+    const regime = regimeEngine.classifyRegime(regimeWindow, { ...regimeEngine.DEFAULT_THRESHOLDS, erLookback: th.regimeLookback });
     if (regime.efficiencyRatio !== null && regime.efficiencyRatio > th.maxTrendEfficiency) { i++; continue; } // trending too hard to fade
 
     const bias = deviation > 0 ? 'SELL' : 'BUY'; // price above VWAP -> fade down; below -> fade up
@@ -106,7 +121,7 @@ function runVwapReversionBacktest(bars, opts = {}) {
       if (hitSL) { result = 'SL'; r = -1; exitIdx = k; break; }
       if (hitTarget) { result = 'TARGET'; r = Math.abs(target - entryPrice) / risk; exitIdx = k; break; }
     }
-    days.push({ date: ctParts(b.time).dateKey, time: b.time, bias, entryPrice, sl, target, result, r, deviation: +deviation.toFixed(2) });
+    days.push({ date: ctParts(b).dateKey, time: b.time, bias, entryPrice, sl, target, result, r, deviation: +deviation.toFixed(2) });
     i += Math.max(1, exitIdx + 1); // don't re-enter mid-trade on the same move
   }
 
