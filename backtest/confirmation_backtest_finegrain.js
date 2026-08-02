@@ -122,7 +122,7 @@ function truncate(bars, cutoffTime) {
   return idx === -1 ? bars : bars.slice(0, idx);
 }
 
-function scoreTradeFine(bias, quote, entryZone, hourlyBarsFull, m1BarsFull, cutoffTime, ictResult, orbResult) {
+function scoreTradeFine(bias, quote, entryZone, hourlyBarsFull, m1BarsFull, cutoffTime, ictResult, orbResult, weights) {
   const availableHourly = truncate(hourlyBarsFull, cutoffTime);
   const availableM1 = truncate(m1BarsFull, cutoffTime);
   if (availableHourly.length < 60 || availableM1.length < 60) return null;
@@ -132,7 +132,7 @@ function scoreTradeFine(bias, quote, entryZone, hourlyBarsFull, m1BarsFull, cuto
   const weekly = fractalEngine.aggregateToTimeframe(daily, 'week');
   const monthly = fractalEngine.aggregateToTimeframe(daily, 'month');
   const barsByTF = { m1: recentM1, h1: availableHourly.slice(-200), h4, d1: daily, weekly, monthly };
-  return confirmationEngine.computeConfirmation({ bias, quote, entryZone, executionBars: recentM1, barsByTF, ictResult, orbResult });
+  return confirmationEngine.computeConfirmation({ bias, quote, entryZone, executionBars: recentM1, barsByTF, ictResult, orbResult }, weights);
 }
 
 function stratifyByTier(results) {
@@ -150,25 +150,15 @@ function stratifyByTier(results) {
   return byTier;
 }
 
-(async () => {
-  const deepPath = path.join(__dirname, 'deep_1m.json');
-  if (!fs.existsSync(deepPath)) {
-    console.error('backtest/deep_1m.json not found. Build it first with:');
-    console.error('  PXBOT_EMAIL=... PXBOT_PASSWORD=... PXBOT_SERVER=... node backtest/fetch_deep.js 1m 200');
-    process.exit(1);
-  }
-  const m1Bars = JSON.parse(fs.readFileSync(deepPath, 'utf8'));
-  console.log(`Loaded ${m1Bars.length} real 1-minute bars, ${((m1Bars[m1Bars.length - 1].time - m1Bars[0].time) / 86400).toFixed(1)} days.`);
-
-  const health = await get('/api/health');
-  if (!health.authenticated) { console.error('Not connected to TradeLocker — log in via the app UI first, then re-run this.'); process.exit(1); }
-  const h1data = await get('/api/candles?resolution=60&count=19000');
-  if (!h1data.bars || !h1data.bars.length) { console.error('No hourly bars.'); process.exit(1); }
-  const hourlyBars = h1data.bars;
-  console.log(`Loaded ${hourlyBars.length} hourly bars for classification + MTF context.\n`);
-
+// weights: optional, defaults to confirmationEngine.DEFAULT_WEIGHTS (same as
+// before this parameter existed). Each result now also carries `factors`
+// (the full per-factor agree/disagree breakdown) so callers — like
+// backtest/calibrate_weights.js — can run real evidence-based weight
+// calibration against REAL 1-minute-execution trades, not just tier/confidence.
+function runFinegrainConfirmationBacktest(hourlyBars, m1Bars, opts = {}) {
   const ictTh = { ...ictEngine.DEFAULT_THRESHOLDS, minLegSize: 199 };
   const orbTh = { ...orbEngine.DEFAULT_ORB, rangeHour: 9, targetMultiple: 0.5, slBufferPct: 0.05, minRangeSize: 100 };
+  const weights = opts.weights || confirmationEngine.DEFAULT_WEIGHTS;
 
   const classByDate = sliceByDateFine(hourlyBars);
   const execByDate = sliceByDateFine(m1Bars);
@@ -189,10 +179,10 @@ function stratifyByTier(results) {
         if (sim.entered) {
           const decisionTime = sess.london[sess.london.length - 1].time;
           const entryZone = { low: levels.oteLow, high: levels.oteHigh };
-          const report = scoreTradeFine(cls.bias, sim.entryPrice, entryZone, hourlyBars, m1Bars, decisionTime, { bias: cls.bias }, null);
+          const report = scoreTradeFine(cls.bias, sim.entryPrice, entryZone, hourlyBars, m1Bars, decisionTime, { bias: cls.bias }, null, weights);
           if (report) {
             const r = sim.result === 'SL' ? -1 : (sim.result === 'TIMEOUT' ? 0 : Number(sim.r) || 0);
-            results.push({ date: dateKey, strategy: 'ICT', bias: cls.bias, tier: report.tier, confidence: report.confidence, r, result: sim.result, time: decisionTime });
+            results.push({ date: dateKey, strategy: 'ICT', bias: cls.bias, tier: report.tier, confidence: report.confidence, factors: report.factors, r, result: sim.result, time: decisionTime });
           }
         }
       }
@@ -211,12 +201,36 @@ function stratifyByTier(results) {
     const size = entry.rangeBar.high - entry.rangeBar.low;
     const entryPrice = sim.bias === 'BUY' ? entry.rangeBar.high : entry.rangeBar.low;
     const entryZone = { low: Math.min(entryPrice, entryPrice - size * 0.1), high: Math.max(entryPrice, entryPrice + size * 0.1) };
-    const report = scoreTradeFine(sim.bias, entryPrice, entryZone, hourlyBars, m1Bars, decisionTime, null, { bias: sim.bias });
+    const report = scoreTradeFine(sim.bias, entryPrice, entryZone, hourlyBars, m1Bars, decisionTime, null, { bias: sim.bias }, weights);
     if (!report) continue;
-    results.push({ date: dateKey, strategy: 'ORB', bias: sim.bias, tier: report.tier, confidence: report.confidence, r: sim.r, result: sim.exit, time: decisionTime });
+    results.push({ date: dateKey, strategy: 'ORB', bias: sim.bias, tier: report.tier, confidence: report.confidence, factors: report.factors, r: sim.r, result: sim.exit, time: decisionTime });
   }
 
   results.sort((a, b) => a.time - b.time);
+  return results;
+}
+
+async function loadFinegrainData() {
+  const deepPath = path.join(__dirname, 'deep_1m.json');
+  if (!fs.existsSync(deepPath)) {
+    throw new Error('backtest/deep_1m.json not found. Build it first with: PXBOT_EMAIL=... PXBOT_PASSWORD=... PXBOT_SERVER=... node backtest/fetch_deep.js 1m 200');
+  }
+  const m1Bars = JSON.parse(fs.readFileSync(deepPath, 'utf8'));
+  const health = await get('/api/health');
+  if (!health.authenticated) throw new Error('Not connected to TradeLocker — log in via the app UI first, then re-run this.');
+  const h1data = await get('/api/candles?resolution=60&count=19000');
+  if (!h1data.bars || !h1data.bars.length) throw new Error('No hourly bars.');
+  return { hourlyBars: h1data.bars, m1Bars };
+}
+
+module.exports = { runFinegrainConfirmationBacktest, stratifyByTier, loadFinegrainData };
+
+if (require.main === module) (async () => {
+  const { hourlyBars, m1Bars } = await loadFinegrainData();
+  console.log(`Loaded ${m1Bars.length} real 1-minute bars, ${((m1Bars[m1Bars.length - 1].time - m1Bars[0].time) / 86400).toFixed(1)} days.`);
+  console.log(`Loaded ${hourlyBars.length} hourly bars for classification + MTF context.\n`);
+
+  const results = runFinegrainConfirmationBacktest(hourlyBars, m1Bars);
   console.log(`${results.length} trades scored at REAL 1-minute execution granularity (ICT + ORB combined, no-lookahead).\n`);
 
   console.log('=== COMBINED (real 1m execution, real MTF context) ===');
