@@ -426,6 +426,35 @@ against the spec: prev-day-level breakout with a FIXED ≤30pt stop and fixed 40
 strongest level type from round 3, re-geometried to the cap), and a session-filtered variant of
 6d (Asia + NY AM windows only) IF automated execution is ever on the table.
 
+## Round 7 — bigger targets + higher win rate under the 30pt cap: both rejected
+
+**Reproduce:** `node backtest/research_phase5.js --only=prevday_fixedstop_1m,fvg_hourly_1m_entry --spread=1.32`
+
+| Candidate | Folds | Trades | Win rate | RR | Expectancy | Verdict |
+|---|---|---|---|---|---|---|
+| prevday_fixedstop_1m (fixed 25/30pt stop, 40/60/100pt targets, premarket/NY-AM) | 3/5 | 59 | 45.76% | 1.367 | **+0.0895R** | REJECTED — 4 distinct configs in 5 folds; per-fold n of 7–22 makes fold outcomes coin flips |
+| fvg_hourly_1m_entry (validated hourly FVG signal, deeper 1m entry, fixed ≤30pt stop) | 1/3 | 35 | 40.0% | 1.238 | -0.1122R | REJECTED — the hourly FVG edge evidently NEEDS its wide structural stop; compressing to 30pts converts winners into stop-outs |
+
+prevday_fixedstop_1m is positive-expectancy overall and partially consistent across folds
+(retest style 4/5, 40pt target 4/5, Tue/Wed/Thu 4/5) — but unlike the fvg_continuation_narrow
+rescue (16–52 trades/fold, 5/5 agreement on the fixed params), per-fold samples of 7–12 trades
+cannot distinguish signal from noise, so a "principled narrowing" here would be curve-fitting.
+Verdict: INSUFFICIENT_TRADES at this frequency (~0.33/day) in the 267-day 1m window — revisit as
+1m history accumulates, do not rescue now.
+
+**Accumulated verdict on the literal constraint set (fixed ≤30pt stop + 40–100pt targets on NQ):**
+four mechanically distinct entry types have now been tested against it — opening-range retest
+(both sessions, ~35% WR), prev-day-level break/retest (46% WR, unstable), deep-FVG entry (40% WR)
+— and none produced a stable validated edge. The consistent picture: NQ's ordinary noise exceeds
+30pts on the path to 40–100pt moves, so tight fixed stops get run before big targets are reached.
+The one system validated with targets in the operator's band (hourly FVG: 58% WR, ~45–55pt
+targets) needs a ~45–55pt stop — just outside the cap. **Stop WIDTH and dollar RISK are not the
+same thing**: at constant dollar risk, halving position size doubles affordable stop width (e.g.
+$500 risk = 8 MNQ at a 30pt stop, or 5 MNQ at a 50pt stop). Whether the validated system fits the
+operator's real constraint depends on whether the 30pt cap is a literal stop-distance rule from
+their prop firm (rare) or a dollar-risk habit expressed in points (common) — an operator question,
+not a research question.
+
 ## Trade-frequency math for the 1,000-trade target
 
 At a practical operating cadence (~2 trades/day, ~250 trading days/year), 1,000 trades needs about
