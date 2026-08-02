@@ -214,9 +214,18 @@ function simulateTradeManaged(bias, levels, forwardBars, maxBars) {
 }
 
 // Full backtest over continuous hourly (or finer) bars.
+// opts.allowedScenarios: which classified scenario IDs (1/2/3) are actually
+// tradeable — defaults to all three (identical to this function's original
+// behavior, so every existing caller is unaffected). Added to isolate
+// scenario 2 (London sweep-then-continuation) from scenario 1 (pure Asia-
+// directional) after real data showed them behaving very differently when
+// combined into one signal — S2 real production-config numbers: 85.7% win
+// rate, +0.09R avg (n=7) vs S1's 50% win rate, -0.23R avg (n=16); combining
+// them into one "ICT" signal diluted the good one with the bad one.
 function runBacktest(bars, opts = {}) {
   const th = { ...DEFAULT_THRESHOLDS, ...(opts.thresholds || {}) };
   const maxForwardBars = opts.maxForwardBars || 30;
+  const allowedScenarios = opts.allowedScenarios || [1, 2, 3];
   const byDate = sliceSessions(bars);
   const days = [];
 
@@ -226,7 +235,7 @@ function runBacktest(bars, opts = {}) {
     const cls = classifyDay(sess.asia, sess.london, th);
     const day = { date: dateKey, scenario: cls.id, bias: cls.bias, reason: cls.reason };
 
-    if (cls.id === 0 || cls.id === 4) { days.push(day); continue; }
+    if (cls.id === 0 || cls.id === 4 || !allowedScenarios.includes(cls.id)) { days.push(day); continue; }
 
     const levels = legLevels(cls.bias, cls.legLow, cls.legHigh, th);
     const forward = [...sess.ny, ...sess.forward];
@@ -275,6 +284,7 @@ function runBacktest(bars, opts = {}) {
 function runBacktestManaged(bars, opts = {}) {
   const th = { ...DEFAULT_THRESHOLDS, ...(opts.thresholds || {}) };
   const maxForwardBars = opts.maxForwardBars || 30;
+  const allowedScenarios = opts.allowedScenarios || [1, 2, 3];
   const byDate = sliceSessions(bars);
   const days = [];
 
@@ -284,7 +294,7 @@ function runBacktestManaged(bars, opts = {}) {
     const cls = classifyDay(sess.asia, sess.london, th);
     const day = { date: dateKey, scenario: cls.id, bias: cls.bias, reason: cls.reason };
 
-    if (cls.id === 0 || cls.id === 4) { days.push(day); continue; }
+    if (cls.id === 0 || cls.id === 4 || !allowedScenarios.includes(cls.id)) { days.push(day); continue; }
 
     const levels = legLevels(cls.bias, cls.legLow, cls.legHigh, th);
     const forward = [...sess.ny, ...sess.forward];

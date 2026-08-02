@@ -23,3 +23,4 @@ engine/confirmation_weights.proposed.json
 backtest/vwap_reversion_results.json
 backtest/trend_pullback_results.json
 backtest/session_breakout_results.json
+backtest/ict_scenario_isolation_results.json
