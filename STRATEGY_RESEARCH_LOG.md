@@ -303,6 +303,129 @@ comparable safe risk level was lower with a slower, less reliable path to target
   and `SCALE_READY` requires the full remaining checklist (ensemble correlation check, real-fill
   cost measurement, a second independent holdout period as more calendar time accumulates).
 
+## Round 6 — the 30pt stop cap, measured costs, and the first 1,000+-trade validated system
+
+**New hard operator constraints stated mid-session:** max 30-point protective stop; preferred
+targets 30–100+pts; 2–3 trades/day across Asia and NY premarket/AM; must scale funded accounts.
+
+**Reproduce:** `node backtest/research_phase5.js --only=fvg_1m_capped,micro_orb_1m_capped,asia_fade_1m_capped`
+(assumed 2pt spread), then `scripts/measure_spread.js`, then
+`node backtest/research_phase5.js --only=retest_nyopen_1m,retest_asia_1m,fvg_1m_capped --spread=1.32`
+
+### 6a. The win-rate lesson, demonstrated on real data
+
+Three ≤30pt-stop candidates were built on real 1-minute data with a selection rule that maximizes
+win rate subject to positive train expectancy. Results under the assumed 2pt spread:
+
+| Candidate | Trades | Win rate | Expectancy | Verdict |
+|---|---|---|---|---|
+| asia_fade_1m_capped (holdout) | 31 | **87.1%** | **-0.021R** | REJECTED — holdout unprofitable |
+| fvg_1m_capped | 1,300 | 78.0% | -0.019R | REJECTED — 0/4 folds |
+| micro_orb_1m_capped | **0** | — | — | REJECTED — NQ opening ranges are structurally wider than a 30pt stop permits; zero qualifying days |
+
+**The operator's requested ~90% win rate was effectively found — 87.1% on an untouched holdout —
+and it loses money.** 8pt winners cannot pay for 30pt losers plus costs. Win rate is purchasable;
+expectancy is not. This is the empirical demonstration, not a lecture.
+
+### 6b. Costs measured, not assumed
+
+`scripts/measure_spread.js` sampled 70 live quotes from this account's real feed (Sunday Globex
+reopen — typically the week's worst liquidity): **median spread 1.32pts** (p95 1.32, max 1.57) vs.
+the 2pt assumption used everywhere prior. At ≤30pt stops the difference is ~0.02–0.05R/trade —
+exactly the margin the near-breakeven scalps died by. Slippage (1pt) remains an assumption; no
+real fills exist yet to measure it. Saved: `data/logs/measured_spread.json`.
+
+### 6c. The operator's stated geometry (≤30pt stop, 30–100pt targets): REJECTED
+
+Breakout-retest continuation (close-confirmed break of the opening/Asia range, pullback entry at
+the level, fixed 20–30pt stop, 1.5–3R targets), both sessions, measured spread:
+
+| Candidate | Folds | Trades | Win rate | RR | Expectancy | Verdict |
+|---|---|---|---|---|---|---|
+| retest_nyopen_1m | 1/5 | 116 | 34.48% | 1.226 | -0.2506R | REJECTED |
+| retest_asia_1m | 1/5 | 92 | 35.87% | 1.151 | -0.2465R | REJECTED |
+
+At 1.5–3R targets these needed ~40–50% win rates; they achieved ~35%. NQ pullback-retests at
+tight fixed stops get run through too often before continuing. This exact geometry, on this
+instrument, at this stop cap, does not currently show an edge — stated plainly.
+
+### 6d. fvg_1m_capped under MEASURED costs: ACCEPTED — first system past the 1,000-trade bar
+
+The same 1m FVG candidate that failed by -0.019R under the 2pt spread assumption, re-run with the
+measured 1.32pt spread:
+
+| | Walk-forward OOS | Untouched holdout |
+|---|---|---|
+| Trades | 1,523 | **907** |
+| Folds | 4/5 profitable, **same config in 5/5 folds** (minGapSize=12, target 0.5R, Mon–Fri) | — |
+| Win rate | 79.05% | **79.49%** |
+| Expectancy | +0.0288R | **+0.0364R** (holdout better than dev) |
+| Profit factor | 1.126 | — |
+
+**2,430 total qualifying validation trades — the first candidate to clear Part 8's 1,000-trade
+requirement**, from one strategy, one timeframe, chronologically non-overlapping by construction.
+Ledger deep-dive: median stop 20.3pts (max 31.6 — cap respected), maxDD 11.95R, max 5 consecutive
+losses, 75% of months profitable, positive in every session bucket except ny_open (~flat) and
+afterhours (negative).
+
+### 6e. The honest problems with 6d (read before celebrating)
+
+1. **It is not manually tradeable.** 15.4 trades/day average (max 51), average hold time ~1.1
+   minutes, median target ~10pts. This is an automated scalper's profile. PXBOT is deliberately
+   read-only/manual-execution — no order path exists — and the operator asked for 2–3 deliberate
+   trades/day. This system cannot be traded by a human clicking buttons, and it does NOT meet the
+   operator's stated 30–100pt-target preference.
+2. **The edge is thin and cost-fragile.** +0.03R/trade flips negative at a 2pt spread (proven in
+   6a — same candidate, same data). It lives or dies on ~0.7pts of spread and the still-unmeasured
+   slippage assumption. A 0.5–1pt real slippage difference kills it.
+3. **7.1% ambiguous fills** (stop and target both touched within one 1m bar), resolved
+   conservatively (stop-first), so the reported number is a floor in that one respect — but heavy
+   intrabar-sequencing dependence is inherent to 1-minute scalping and adds real-world variance.
+4. **Two of five folds were ~flat** (+0.0016, -0.0032) — the OOS profit concentrates in folds 4–5
+   and the holdout (the most recent months). Could be regime-dependence; could be genuine recency
+   of the edge. Unknown.
+5. Multiple-testing: ~18th configuration tested this session. The acceptance evidence is the
+   strongest of the session (n=2,430, 5/5 config stability, holdout > dev), but the bar stays high.
+
+**Status: RESEARCH_ONLY.** It clears the trade-count bar and the statistical gates, but fails the
+operator's own operational constraints (manual execution, target size) and is cost-fragile. Its
+realistic use would require automated execution — a deliberate architectural decision PXBOT has so
+far refused (read-only by design) — plus NY-hours spread/slippage measurement first.
+
+### 6f. Funded-account Monte Carlo on the 2,430 real trades (backtest/funded_account_report_fvg1m.json)
+
+10,000 block-bootstrap paths per cell, generic illustrative configs (swap in the real firm's rules
+before any real decision):
+
+| Config / scenario | Best risk with P(fail)≤10% | At that risk: P(reach target before fail) | Median days to target |
+|---|---|---|---|
+| Lenient funded, measured costs | **1.00%** | 92.0% | 13 |
+| Lenient funded, 0.50% risk | (P(fail) 0.5%) | **99.2%** | 32 |
+| Conservative eval, measured costs | 0.25% only | 98.3% | 56 |
+| **Either config, adverse costs (+0.05R, 5% missed, winners -10%)** | **NONE — P(fail) ~100% at every risk level** | ~0% | — |
+| Either config, severe costs | NONE — P(fail) 100% | 0% | — |
+
+**Read both rows.** Under measured costs this system passes a generic eval with near-certainty at
+modest risk. Under adverse execution — just 0.05R/trade worse — it fails with near-certainty. The
+entire outcome pivots on ~0.7pts of spread plus the unmeasured slippage assumption, at 15
+trades/day where costs compound fast. The conservative config's daily-loss rule also bites hard at
+this frequency (0.50% risk → 34% failure purely from daily-loss breaches). This is a knife-edge
+system: genuinely validated, genuinely fragile, and dependent on execution quality that cannot be
+known without live demo fills. It is NOT "ready to scale a funded account" and claiming so would
+be false; it IS the strongest statistical result this codebase has produced and the correct next
+step for it is demo-account forward measurement, not live capital.
+
+### Where this leaves the operator's full requirement set
+
+No tested strategy simultaneously satisfies: manual 2–3 trades/day + ≤30pt stop + 30–100pt targets
++ validated edge. Each pairwise combination was tested honestly: high-WR small-target works only at
+scalper frequency; the 30–100pt-target retest geometry shows no edge at this stop cap; wide-stop
+hourly strategies (ORB, hourly FVG, prev-day-level) all require stops wider than 30pts. The
+constraint set itself — not the research effort — is what's binding. Next candidates worth testing
+against the spec: prev-day-level breakout with a FIXED ≤30pt stop and fixed 40–100pt targets (the
+strongest level type from round 3, re-geometried to the cap), and a session-filtered variant of
+6d (Asia + NY AM windows only) IF automated execution is ever on the table.
+
 ## Trade-frequency math for the 1,000-trade target
 
 At a practical operating cadence (~2 trades/day, ~250 trading days/year), 1,000 trades needs about
