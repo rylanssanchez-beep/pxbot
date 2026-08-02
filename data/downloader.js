@@ -117,6 +117,10 @@ async function downloadResolution(client, store, identity, resolution, opts = {}
     log(`  [${resolution}] History already marked exhausted (oldest=${oldestFetched ? new Date(oldestFetched * 1000).toISOString() : 'n/a'}). Pass --force to re-probe further back.`);
     return { skipped: true };
   }
+  if (historyExhausted && opts.force) {
+    log(`  [${resolution}] --force: re-probing past the previously-recorded exhaustion point (oldest=${oldestFetched ? new Date(oldestFetched * 1000).toISOString() : 'n/a'}).`);
+    historyExhausted = false; // actually re-enter the pagination loop below, not just bypass the skip
+  }
 
   // 2) Paginate backward from oldestFetched (resume point) or now (fresh start).
   let cursor = oldestFetched ?? nowSec;
