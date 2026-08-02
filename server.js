@@ -614,6 +614,34 @@ function hourlyToH4(bars) {
   return out;
 }
 
+// The m1/m5/m15/h4/d1 fetches (+ weekly/monthly aggregation) cost ~2-3s —
+// mostly loopback HTTP + JSON serialization of the 1-minute series, which is
+// by far the largest (13k+ bars). Repeated /api/signal checks within a short
+// window (manual re-clicks, or auto-poll cadence) don't need fully fresh
+// MTF/execution context every single time — 1-minute bars are only that
+// fresh anyway. Cache by wall-clock age, not by bar-time-equality, so it
+// still refreshes on a predictable cadence regardless of exactly when new
+// bars land. h1 is NOT cached here since handleSignal already has it for
+// free from its own existing hourly fetch.
+let _mtfCache = null; // { data: {m1,m5,m15,h4,d1,weekly,monthly}, computedAt }
+const MTF_CACHE_MAX_AGE_MS = 45000;
+
+async function getCachedMTFData() {
+  const now = Date.now();
+  if (_mtfCache && (now - _mtfCache.computedAt) < MTF_CACHE_MAX_AGE_MS) return _mtfCache.data;
+
+  const [m1data, m5, m15, h4data, d1data] = await Promise.all([
+    loopbackGet('/api/candles?resolution=1&count=1000'),
+    loopbackGet('/api/candles?resolution=5&count=300'),
+    loopbackGet('/api/candles?resolution=15&count=300'),
+    loopbackGet('/api/candles?resolution=240&count=500'),
+    loopbackGet('/api/candles?resolution=1440&count=250'),
+  ]);
+  const data = { m1: m1data.bars || [], m5: m5.bars || [], m15: m15.bars || [], h4data, d1data };
+  _mtfCache = { data, computedAt: now };
+  return data;
+}
+
 // Computes the confirmation report for whichever of ict/orb actually fired.
 // Wrapped by the caller in try/catch — a failure here must never break the
 // ict/orb response those fields already depend on.
@@ -632,22 +660,16 @@ async function computeSignalConfirmation(ict, orb, quote, hourlyBars) {
   // 1-minute chart, not hourly. Hourly bars stay in barsByTF as "key levels"
   // MTF context (matching the directive's Monthly/Weekly/Daily/4H/1H/15M/5M/
   // Execution list) but no longer stand in for the execution timeframe.
-  const [m1data, m5, m15, h4data, d1data] = await Promise.all([
-    loopbackGet('/api/candles?resolution=1&count=1000'),
-    loopbackGet('/api/candles?resolution=5&count=300'),
-    loopbackGet('/api/candles?resolution=15&count=300'),
-    loopbackGet('/api/candles?resolution=240&count=500'),
-    loopbackGet('/api/candles?resolution=1440&count=250'),
-  ]);
+  const { m1, m5, m15, h4data, d1data } = await getCachedMTFData();
   const daily = (d1data.bars && d1data.bars.length) ? d1data.bars : hourlyToDaily(hourlyBars);
   const h4 = (h4data.bars && h4data.bars.length) ? h4data.bars : hourlyToH4(hourlyBars);
   // m1 falls back to the hourly series (still better than nothing) only if
   // the 1-minute feed genuinely returned nothing — this account's feed has
   // real 1m depth (verified: 200k+ bars over ~200 days via fetch_deep.js),
   // so this fallback should not normally trigger live.
-  const executionBars = (m1data.bars && m1data.bars.length >= 60) ? m1data.bars.slice(-1000) : hourlyBars.slice(-200);
+  const executionBars = (m1 && m1.length >= 60) ? m1.slice(-1000) : hourlyBars.slice(-200);
   const barsByTF = {
-    m1: executionBars, m5: m5.bars || [], m15: m15.bars || [], h1: hourlyBars.slice(-200), h4, d1: daily,
+    m1: executionBars, m5: m5 || [], m15: m15 || [], h1: hourlyBars.slice(-200), h4, d1: daily,
     weekly: fractalEngine.aggregateToTimeframe(daily, 'week'),
     monthly: fractalEngine.aggregateToTimeframe(daily, 'month'),
   };
