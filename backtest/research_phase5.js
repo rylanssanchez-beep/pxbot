@@ -278,10 +278,11 @@ function tradesFromPrevDayLevel(bars, params) {
   const byDate = new Map();
   for (const b of bars) {
     const { hour, dateKey, dow } = ctParts(b.time);
-    if (!byDate.has(dateKey)) byDate.set(dateKey, { all: [], nyOpen: [], dow });
+    if (!byDate.has(dateKey)) byDate.set(dateKey, { all: [], nyOpen: [], rest: [], dow });
     const day = byDate.get(dateKey);
     day.all.push(b);
     if (hour >= 9.5 && hour < 15) day.nyOpen.push(b);
+    else if (hour >= 15 && hour < 19) day.rest.push(b); // afterhours — execution room beyond the entry-search window, not a data cutoff
   }
   const dateKeys = [...byDate.keys()].sort();
   const out = [];
@@ -304,10 +305,19 @@ function tradesFromPrevDayLevel(bars, params) {
     if (!bias) continue;
     const sl = bias === 'LONG' ? prevLow - size * th.slBufferPct : prevHigh + size * th.slBufferPct;
     const target = bias === 'LONG' ? entryPrice + size * th.targetMultiple : entryPrice - size * th.targetMultiple;
+    // Execution gets the full remainder of the tradeable day (nyOpen + rest,
+    // i.e. through 19:00 CT) starting at the entry bar, with a real
+    // sessionCloseAfterHour exit driver — NOT bars.length itself as the cap,
+    // which was this function's original bug (see git history): it made the
+    // engine unable to ever distinguish "genuinely ran out of real data"
+    // from "hit the strategy's own hold-time limit," silently inflating an
+    // apparent edge with mostly-unresolved trades.
+    const execBars = [...today.nyOpen.slice(entryIdx), ...today.rest];
     const r = simulateTrade({
-      bars: today.nyOpen, signalIndex: -1, direction: bias, orderType: 'preComputedFill',
-      precomputedEntryIndex: entryIdx, precomputedEntryPriceRaw: entryPrice,
-      stopPrice: sl, targetPrice: target, exitPlan: { maxHoldingBars: today.nyOpen.length }, costModel: COST_MODEL,
+      bars: execBars, signalIndex: -1, direction: bias, orderType: 'preComputedFill',
+      precomputedEntryIndex: 0, precomputedEntryPriceRaw: entryPrice,
+      stopPrice: sl, targetPrice: target,
+      exitPlan: { maxHoldingBars: execBars.length, sessionCloseAfterHour: 19 }, costModel: COST_MODEL, ctPartsFn: ctParts,
     });
     if (r.filled) out.push(r);
   }
@@ -373,7 +383,15 @@ const CANDIDATES = {
   },
 };
 
-function avgR(trades) { return trades.length ? trades.reduce((a, t) => a + t.rMultiple, 0) / trades.length : -Infinity; }
+// Defense in depth: END_OF_DATA trades (the execution array ran out before
+// we could know what would have happened) are NOT real completed decisions
+// — computeMetrics already excludes them for reporting, and every scoring/
+// gating decision in this file must too, or a candidate function with a
+// truncated-execution-window bug (this file has already had one — see
+// tradesFromPrevDayLevel's fix) can silently pass gates on trades that
+// never actually resolved.
+function cleanTrades(trades) { return trades.filter(t => t.exitReason !== 'END_OF_DATA'); }
+function avgR(trades) { const c = cleanTrades(trades); return c.length ? c.reduce((a, t) => a + t.rMultiple, 0) / c.length : -Infinity; }
 
 function runWalkForward(label, bars, spec) {
   const holdoutStart = Math.floor(bars.length * (1 - HOLDOUT_FRACTION));
@@ -388,18 +406,19 @@ function runWalkForward(label, bars, spec) {
     if (!test.length) break;
 
     const scored = spec.grid.map(params => {
-      const trades = spec.fn(train, params);
+      const trades = cleanTrades(spec.fn(train, params));
       return { params, trades: trades.length, avgR: trades.length >= MIN_TRAIN_TRADES ? avgR(trades) : -Infinity };
     }).filter(s => s.trades >= MIN_TRAIN_TRADES);
     scored.sort((a, b) => b.avgR - a.avgR);
     const best = scored[0];
     if (!best) { foldResults.push({ fold: f, skipped: true }); continue; }
 
-    const testTrades = spec.fn(test, best.params);
+    const testTradesRaw = spec.fn(test, best.params);
+    const testTrades = cleanTrades(testTradesRaw);
     foldResults.push({
       fold: f, picked: best.params, trainAvgR: +best.avgR.toFixed(4),
       testN: testTrades.length, testAvgR: testTrades.length ? +avgR(testTrades).toFixed(4) : null,
-      testTrades,
+      testTrades, testTradesExcludedEndOfData: testTradesRaw.length - testTrades.length,
     });
   }
 
@@ -407,7 +426,7 @@ function runWalkForward(label, bars, spec) {
   const positiveFolds = validFolds.filter(f => f.testAvgR > 0).length;
   const configs = validFolds.map(f => JSON.stringify(f.picked));
   const uniqueConfigs = new Set(configs).size;
-  const allOosTrades = validFolds.flatMap(f => f.testTrades || []);
+  const allOosTrades = validFolds.flatMap(f => f.testTrades || []); // already clean (END_OF_DATA excluded above)
   const combinedOosAvgR = allOosTrades.length ? avgR(allOosTrades) : null;
 
   // Stability gate: require a config to repeat in at least half the valid
@@ -435,10 +454,12 @@ function runWalkForward(label, bars, spec) {
     // Pick the most-common config across folds (the stable one) for the final holdout check.
     const mostCommonConfigStr = Object.entries(configCounts).sort((a, b) => b[1] - a[1])[0][0];
     const finalConfig = JSON.parse(mostCommonConfigStr);
-    const holdoutTrades = spec.fn(holdoutBars, finalConfig);
-    holdout = { config: finalConfig, n: holdoutTrades.length, avgR: holdoutTrades.length ? +avgR(holdoutTrades).toFixed(4) : null, trades: holdoutTrades };
-    if (!holdoutTrades.length) rejectionReason = 'walk-forward passed but the picked config produced ZERO trades on the untouched final holdout';
+    const holdoutTradesRaw = spec.fn(holdoutBars, finalConfig);
+    const holdoutTrades = cleanTrades(holdoutTradesRaw);
+    holdout = { config: finalConfig, n: holdoutTrades.length, avgR: holdoutTrades.length ? +avgR(holdoutTrades).toFixed(4) : null, trades: holdoutTrades, excludedEndOfData: holdoutTradesRaw.length - holdoutTrades.length };
+    if (!holdoutTrades.length) rejectionReason = 'walk-forward passed but the picked config produced ZERO real (non-END_OF_DATA) trades on the untouched final holdout';
     else if (holdout.avgR <= 0) rejectionReason = `walk-forward passed but the untouched final holdout was NOT profitable (avgR=${holdout.avgR}, n=${holdout.n})`;
+    else if (holdout.n < 15) rejectionReason = `walk-forward passed but the untouched final holdout only had ${holdout.n} real trades — too few to trust despite positive avgR`;
   }
 
   return {
