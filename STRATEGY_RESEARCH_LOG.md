@@ -133,6 +133,54 @@ stronger the evidence required" — continuing to widen grids indefinitely in se
 configuration would itself become the overfitting risk this process exists to prevent, not a
 legitimate next step.
 
+## Round 3 — ORB refinement + a new family (previous-day high/low), with full win/loss/RR reporting
+
+**Reproduce:** `node backtest/research_phase5.js --only=orb_refine,prev_day_level`
+
+Per explicit request: refine ORB specifically (wider grid: range-defining hour 7–10 CT, target
+0.5–2×, stop buffer 5–15%, day filters), test one new strategy family (`tradesFromPrevDayLevel` —
+breakout of the *prior calendar day's* full range during NY hours, mechanically distinct from ORB's
+single-hour range), and report full stats (trades, wins, losses, win rate, RR/payoff ratio,
+expectancy, profit factor) for every result from here on, not just an aggregate avgR number.
+
+**A real bug was caught and fixed before either of these numbers were reported as final** — the
+first `prev_day_level` run showed an eye-catching 80.56% win rate / 5.4x profit factor, but its
+internal counts didn't match (verdict said n=348, detailed stats showed n=72). That was the exact
+same execution-window bug already fixed twice this session (`run_baseline.js`, then
+`diagnose_premarket.js`) recurring a third time in a brand-new function: 79% of that candidate's
+walk-forward trades and 92% of its holdout trades had never actually resolved (`END_OF_DATA`), yet
+were counting toward the accept decision. Fixed at the root (the function now gives execution room
+through 19:00 CT with a real session-close exit) and with defense in depth (every scoring/gating
+step in this file now explicitly excludes unresolved trades, not just the final report). Both
+candidates below were re-run after the fix.
+
+| Candidate | Walk-forward folds profitable | Trades | Wins | Losses | Win rate | Avg win / avg loss | RR (payoff) | Expectancy | Profit factor | Verdict |
+|---|---|---|---|---|---|---|---|---|---|---|
+| orb_refine (wider grid) | 0/5 | 128 | 52 | 76 | 40.63% | 0.78R / -0.953R | 0.818 | **-0.2493R** | 0.56 | **REJECTED** — worse than round-1's already-rejected version once unresolved trades are correctly excluded |
+| prev_day_level | 5/5 | 72 (dev) + 9 (holdout) | 49 + 6 | 23 + 3 | 68.06% (dev) / 66.67% (holdout) | 1.259R / -1.033R | 1.218 | +0.5266R (dev) / +0.5397R (holdout, too small to trust) | 2.595 (dev) | **REJECTED** — walk-forward is genuinely strong and stable (same config picked 4/5 folds), but the untouched holdout only produced 9 real trades, below this project's own 15-trade minimum-holdout-sample gate |
+
+**ORB refinement made things worse, not better** — a wider search over range-hour/target/stop found
+nothing that beats the frozen baseline's own hand-picked config (`rangeHour=8, target=1x,
+slBuffer=0.1`). That config isn't a lucky guess; broader search around it doesn't improve on it.
+
+**prev_day_level is the most promising lead so far** — 5/5 walk-forward folds profitable, a stable
+picked config, real win rate/RR that would clear the baseline if confirmed — but it does not clear
+this project's own bar because the untouched final holdout is too small (9 trades) to trust despite
+being positive. This is not a rejection of the mechanism; it is an honest "not enough evidence yet"
+verdict, exactly the language Part 9 asks for. Revisit once either (a) more calendar time has
+accumulated in the real dataset, or (b) the holdout window is deliberately shrunk in a way that's
+still methodologically defensible (would need justification, not just moved until it passes).
+
+## Trade-frequency math for the 1,000-trade target
+
+At a practical operating cadence (~2 trades/day, ~250 trading days/year), 1,000 trades needs about
+2 years — achievable from the real ~2.6-year hourly window we have. But **no single strategy tested
+so far fires anywhere near that often**: ORB ~0.46/day, PREMARKET ~0.4/day, prev_day_level
+~0.15/day. Reaching that frequency (and therefore reaching 1,000 real trades within the available
+history) requires an ensemble of multiple validated, non-overlapping modules — reinforcing Part 8's
+own guidance, not a new conclusion, but now grounded in this session's actual measured frequencies
+rather than an assumption.
+
 **Recommended direction from here**, in priority order:
 1. Stop searching for brand-new independent strategy families for now. ORB is the one mechanism in
    this entire codebase with a demonstrated, real, stable edge (`CURRENT_STRATEGY_BASELINE.md`:
