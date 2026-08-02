@@ -1364,8 +1364,19 @@ function renderFibTable(high, low, bias) {
 }
 
 // ─── Market Structure Engine ──────────────────────────────────────────────────
-// Detects BOS, CHOCH, MSS, Equal Highs/Lows from raw candle array
+// Detects BOS, CHOCH, MSS, Equal Highs/Lows from raw candle array.
+// Delegates to engine/structure_engine.js (loaded via <script> in index.html,
+// shared with server.js/sandbox/build.js so this logic exists in exactly one
+// place) when available; falls back to the inline copy below if the shared
+// script didn't load, so this never becomes a hard dependency.
 function detectStructure(candles) {
+  if (typeof window !== 'undefined' && window.StructureEngine && window.StructureEngine.detectStructure) {
+    return window.StructureEngine.detectStructure(candles);
+  }
+  return detectStructureInline(candles);
+}
+
+function detectStructureInline(candles) {
   if (candles.length < 10) return { swingHighs: [], swingLows: [], bosPoints: [], chochPoints: [], eqHighs: [], eqLows: [] };
 
   // ── Find swing highs / lows (3-bar lookback each side) ─────────────────────

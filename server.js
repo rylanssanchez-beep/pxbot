@@ -14,6 +14,8 @@ const { execFile } = require('child_process');
 const ROOT = __dirname;
 const PORT = 8899;
 
+const structureEngine = require('./engine/structure_engine');
+
 // ── curl-based HTTP helper (bypasses Cloudflare TLS fingerprinting) ───────────
 // Windows 10+ ships curl.exe built-in. curl uses Schannel (WinTLS) which
 // Cloudflare treats as a legitimate client, unlike Node.js's OpenSSL fingerprint.
@@ -1229,50 +1231,34 @@ async function handleTVContext(req, res) {
     const bars1D  = data['1440'] || [];
 
     // Swing H/L detection on daily bars — ICT external liquidity levels
-    const swings = [];
-    for (let i = 2; i < bars1D.length - 2; i++) {
-      const b = bars1D[i];
-      if (b.high > bars1D[i-1].high && b.high > bars1D[i-2].high && b.high > bars1D[i+1].high && b.high > bars1D[i+2].high)
-        swings.push({ type:'SH', price: +b.high.toFixed(2), nqAdj: +(b.high-150).toFixed(2), date: new Date(b.time*1000).toLocaleDateString() });
-      if (b.low < bars1D[i-1].low && b.low < bars1D[i-2].low && b.low < bars1D[i+1].low && b.low < bars1D[i+2].low)
-        swings.push({ type:'SL', price: +b.low.toFixed(2), nqAdj: +(b.low-150).toFixed(2), date: new Date(b.time*1000).toLocaleDateString() });
-    }
+    // (engine/structure_engine.js — consolidated, same 2-bar-lookback algorithm this used inline before)
+    const swings = structureEngine.findSwingPoints(bars1D, 2).map(s => ({
+      type: s.type, price: +s.price.toFixed(2), nqAdj: +(s.price - 150).toFixed(2),
+      date: new Date(s.bar.time * 1000).toLocaleDateString(),
+    }));
 
     // EQH/EQL detection — equal highs/lows within 10pts on daily (liquidity pools)
-    const eqLevels = [];
-    for (let i = 0; i < bars1D.length - 1; i++) {
-      for (let j = i+1; j < Math.min(i+10, bars1D.length); j++) {
-        if (Math.abs(bars1D[i].high - bars1D[j].high) < 10)
-          eqLevels.push({ type:'EQH', price: +((bars1D[i].high+bars1D[j].high)/2).toFixed(2), dates: [new Date(bars1D[i].time*1000).toLocaleDateString(), new Date(bars1D[j].time*1000).toLocaleDateString()] });
-        if (Math.abs(bars1D[i].low - bars1D[j].low) < 10)
-          eqLevels.push({ type:'EQL', price: +((bars1D[i].low+bars1D[j].low)/2).toFixed(2), dates: [new Date(bars1D[i].time*1000).toLocaleDateString(), new Date(bars1D[j].time*1000).toLocaleDateString()] });
-      }
-    }
+    const eqLevels = structureEngine.findEqualLevels(bars1D, 10, 10).map(e => ({
+      type: e.type, price: +e.price.toFixed(2),
+      dates: [new Date(e.barI.time * 1000).toLocaleDateString(), new Date(e.barJ.time * 1000).toLocaleDateString()],
+    }));
 
     // ATR(14) on daily bars for volatility context
     let atr14d = null;
     if (bars1D.length >= 15) {
-      const trs = bars1D.slice(-15).map((b,i,a)=> i===0 ? b.high-b.low : Math.max(b.high-b.low,Math.abs(b.high-a[i-1].close),Math.abs(b.low-a[i-1].close)));
-      atr14d = +(trs.slice(-14).reduce((a,b)=>a+b,0)/14).toFixed(1);
+      atr14d = +structureEngine.atr(bars1D, 14).toFixed(1);
     }
 
     // Weekly profile — last 10 weeks, each week's open/high/low/close/range
     const weeklyProfile = [];
     if (bars1D.length > 5) {
-      let wStart = 0;
-      while (wStart < bars1D.length) {
-        const wSlice = bars1D.slice(wStart, wStart+5);
-        if (wSlice.length >= 1) {
-          weeklyProfile.push({
-            weekStart: new Date(wSlice[0].time*1000).toLocaleDateString(),
-            open:  +wSlice[0].open.toFixed(2), close: +wSlice[wSlice.length-1].close.toFixed(2),
-            high:  +Math.max(...wSlice.map(b=>b.high)).toFixed(2),
-            low:   +Math.min(...wSlice.map(b=>b.low)).toFixed(2),
-            range: +(Math.max(...wSlice.map(b=>b.high)) - Math.min(...wSlice.map(b=>b.low))).toFixed(1),
-            bias:  wSlice[wSlice.length-1].close > wSlice[0].open ? 'BULL' : 'BEAR',
-          });
-        }
-        wStart += 5;
+      for (const w of structureEngine.weeklyProfile(bars1D, 5)) {
+        weeklyProfile.push({
+          weekStart: new Date(w.weekStartTime * 1000).toLocaleDateString(),
+          open: +w.open.toFixed(2), close: +w.close.toFixed(2),
+          high: +w.high.toFixed(2), low: +w.low.toFixed(2), range: +w.range.toFixed(1),
+          bias: w.bias,
+        });
       }
     }
 
