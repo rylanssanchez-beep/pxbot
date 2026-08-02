@@ -12,3 +12,7 @@ backtest/deep_*.json
 backtest/finegrain_results.json
 backtest/orb_results.json
 backtest/signal_journal.json
+backtest/confirmation_backtest_results.json
+backtest/confirmation_backtest_synthetic_results.json
+backtest/montecarlo_results.json
+backtest/stress_test_results.json

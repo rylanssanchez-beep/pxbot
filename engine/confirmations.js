@@ -61,7 +61,11 @@ function findOrderBlocks(bars, th = DEFAULT_THRESHOLDS) {
     const isUp = candidate.close > candidate.open;
     if (!isDown && !isUp) continue;
 
-    const atrVal = structureEngine.atr(bars.slice(0, i + 1), th.obAtrPeriod);
+    // atr() only ever looks at the trailing (period+1) bars anyway — pass it
+    // that small window directly instead of bars.slice(0, i+1), which would
+    // re-copy the entire prefix on every iteration (O(n) per call, O(n^2)
+    // for the whole loop on a long history).
+    const atrVal = structureEngine.atr(bars.slice(Math.max(0, i - th.obAtrPeriod), i + 1), th.obAtrPeriod);
     if (!atrVal) continue;
 
     const impulse = bars.slice(i + 1, i + 1 + th.obImpulseLookback);
@@ -110,7 +114,7 @@ function vwap(bars) {
 function findDisplacements(bars, th = DEFAULT_THRESHOLDS) {
   const out = [];
   for (let i = th.obAtrPeriod; i < bars.length; i++) {
-    const atrVal = structureEngine.atr(bars.slice(0, i + 1), th.obAtrPeriod);
+    const atrVal = structureEngine.atr(bars.slice(Math.max(0, i - th.obAtrPeriod), i + 1), th.obAtrPeriod);
     if (!atrVal) continue;
     const b = bars[i];
     const range = b.high - b.low;
