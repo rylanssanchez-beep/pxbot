@@ -182,11 +182,21 @@ function runOrbBaseline(hourlyBars, costModel, runId) {
 // this strategy). Hold-time: the original 1-minute-precision validation's
 // exact bar-count parameter is not recoverable from the committed codebase
 // (session_breakout_regime_walkforward.js and siblings all validated on
-// HOURLY bars, not 1-minute — see run_baseline's header comment). This
-// baseline instead uses a session-close exit (hold until 15:00 CT, matching
-// the strategy's stated intent to ride the NY session) as a documented,
-// reproducible choice — NOT a reproduction of an unseen historical script's
-// parameters. Flagged explicitly in CURRENT_STRATEGY_BASELINE.md.
+// HOURLY bars, not 1-minute — see run_baseline's header comment).
+//
+// scripts/diagnose_premarket.js isolated this precisely (see its output /
+// the git log): forcing an early 15:00 CT close vs. letting the trade ride
+// to 19:00 CT (the same "forward" session boundary ict_engine.js/
+// orb_engine.js already use — hour>=15 is "afterhours", still part of the
+// tradeable day, not excluded, in both those engines) is the dominant
+// factor, NOT data recency (first-207-days vs full-267-day vs last-60-days
+// all show the same sign under either exit rule). 15:00 was an
+// inconsistent, less-justified cutoff for this one strategy; this baseline
+// now uses 19:00, matching the session boundary already established
+// elsewhere in this codebase. This does not fully reproduce the old
+// PREMARKET_TRACK_RECORD number (still below it, and cost assumptions
+// explain another real chunk of the gap) but the sign and the mechanism
+// are now understood and reproducible, not a mystery.
 function runPremarketBaseline(minuteBars, costModel, runId) {
   const th = { targetMultiple: 0.5, slBufferPct: 0.05, minRangeSize: 100, allowedDaysOfWeek: [2, 3, 4] };
   const byDate = new Map();
@@ -221,15 +231,15 @@ function runPremarketBaseline(minuteBars, costModel, runId) {
     const sl = bias === 'LONG' ? pmLow - size * th.slBufferPct : pmHigh + size * th.slBufferPct;
     const target = bias === 'LONG' ? entryPriceRaw + size * th.targetMultiple : entryPriceRaw - size * th.targetMultiple;
 
-    // Session-close exit (15:00 CT) via the engine's own mechanism — a
-    // clearly labeled SESSION_CLOSE exit, not lumped into END_OF_DATA/TIME.
-    // maxHoldingBars is just a large safety cap; sessionCloseAfterHour is
-    // the real, intended exit driver for this strategy.
+    // Session-close exit (19:00 CT, see header note) via the engine's own
+    // mechanism — a clearly labeled SESSION_CLOSE exit, not lumped into
+    // END_OF_DATA/TIME. maxHoldingBars is just a large safety cap;
+    // sessionCloseAfterHour is the real, intended exit driver.
     const result = simulateTrade({
       bars: day.forward, signalIndex: -1, direction: bias, orderType: 'preComputedFill',
       precomputedEntryIndex: entryIdx, precomputedEntryPriceRaw: entryPriceRaw,
       stopPrice: sl, targetPrice: target,
-      exitPlan: { maxHoldingBars: day.forward.length, sessionCloseAfterHour: 15 },
+      exitPlan: { maxHoldingBars: day.forward.length, sessionCloseAfterHour: 19 },
       costModel, ctPartsFn: ctParts,
     });
     if (!result.filled) continue;
