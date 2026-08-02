@@ -2840,10 +2840,11 @@ async function runAISignal() {
     const dsEl = $('aiDataSource');
     if (dsEl) { dsEl.textContent = 'LIVE TL DATA'; dsEl.className = 'pill green-pill'; }
 
-    const ict = sig.ict, orb = sig.orb, premarket = sig.premarket;
+    const ict = sig.ict, orb = sig.orb, premarket = sig.premarket, fvg = sig.fvg;
     const ictFired = ict && ict.bias !== 'WAIT';
     const orbFired = orb && orb.bias !== 'WAIT';
     const premarketFired = premarket && premarket.bias !== 'WAIT';
+    const fvgPending = fvg && fvg.bias !== 'WAIT' && fvg.state === 'PENDING';
 
     // Confirmation engine (server.js:computeSignalConfirmation) — additive
     // context only, does not change ict/orb above. Falls back to the
@@ -2859,16 +2860,34 @@ async function runAISignal() {
       premium_discount_aligned: factorAgrees('dailyPricePosition') || factorAgrees('mtfFractalAlignment'),
     } : { confidence: null, confluence_score: null, order_block_in_ote: false, fvg_in_ote: false, premium_discount_aligned: false };
 
-    // Only the premarket breakout is shown as an actionable trade — it's the
-    // only one of the three that passed every validation check without a
-    // real caveat attached to the core number (see PREMARKET_TRACK_RECORD).
-    // ICT (thin held-out sample, negative on the bigger test) and ORB
-    // (currently losing in the most recent weeks tested) still compute and
-    // log to the journal every check — server.js unchanged, still gathering
-    // real evidence in case either one's picture improves — but neither
-    // surfaces as something to trade right now. Fewer signals, on purpose.
+    // Actionable-signal priority, by strength of validation evidence as of
+    // the 2026-08 research session (STRATEGY_RESEARCH_LOG.md):
+    //   1. FVG PENDING — the most rigorously validated strategy in this
+    //      codebase (5/5 walk-forward folds + 92-trade untouched holdout +
+    //      245 real trades + funded-account Monte Carlo). PENDING means the
+    //      validated entry (a resting limit at the gap edge) can still be
+    //      placed. DEMO-FIRST status — see trackRecord.
+    //   2. Premarket breakout — real but thinner than originally documented
+    //      (the frozen-baseline re-measurement found +0.0065R/trade under
+    //      realistic costs, barely positive; see CURRENT_STRATEGY_BASELINE.md).
+    // ICT (net negative on the full real history) and ORB (edge concentrated
+    // in 2024) still compute and journal every check, but don't surface as
+    // trades. Fewer signals, on purpose.
     let json;
-    if (premarketFired) {
+    if (fvgPending) {
+      json = {
+        scenario: 0, scenario_name: 'Hourly FVG continuation (validated engine — strongest evidence, DEMO-FIRST)',
+        bias: fvg.bias, wait_reason: null,
+        entry_window: 'fvg', entry_window_note: `Resting ${fvg.bias} limit at the gap edge (${fvg.entry}) — NOT a market order. Valid for ${fvg.waitBarsRemaining} more hourly bars, then cancel. Tue/Wed/Thu setups only.`,
+        ote_entry_low: fvg.entry, ote_entry_high: fvg.entry,
+        stop: fvg.sl, target: fvg.target, stop_pts: fvg.riskPts, target_pts: fvg.targetPts,
+        tp1: 0, tp2: fvg.target, tp3: 0, tp1_pts: 0, tp2_pts: fvg.targetPts, tp3_pts: 0,
+        rr: +(fvg.targetPts / Math.max(0.25, fvg.riskPts)).toFixed(1),
+        ...confFields,
+        reasoning: `Validated hourly FVG: place limit ${fvg.bias} at ${fvg.entry}, stop ${fvg.sl} (${fvg.riskPts}pts — size contracts DOWN to your fixed dollar risk), target ${fvg.target} (1R). Track record: ${fvg.trackRecord}`,
+        invalidation: fvg.sl,
+      };
+    } else if (premarketFired) {
       const risk = Math.abs(premarket.entry - premarket.sl);
       json = {
         scenario: 0, scenario_name: 'NY Premarket Breakout (validated engine — strongest evidence)',
@@ -2890,8 +2909,8 @@ async function runAISignal() {
         : '';
       json = {
         scenario: 0, scenario_name: 'No signal', bias: 'WAIT',
-        wait_reason: `Premarket: ${premarket ? premarket.reason : 'not available yet today'}.${heldBackNote}`,
-        reasoning: 'Only trading the premarket breakout right now — the one strategy with real evidence behind it at every check applied. Fewer signals, on purpose.',
+        wait_reason: `FVG: ${fvg ? (fvg.reason || fvg.state) : 'unavailable'}. Premarket: ${premarket ? premarket.reason : 'not available yet today'}.${heldBackNote}`,
+        reasoning: 'Trading only the validated FVG setup (primary) and premarket breakout (secondary) — the two strategies with real evidence at every check applied. Fewer signals, on purpose.',
       };
     }
 

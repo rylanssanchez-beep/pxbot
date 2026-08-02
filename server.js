@@ -547,6 +547,22 @@ function handleHealth(req, res) {
 const ictEngine = require('./backtest/ict_engine');
 const orbEngine = require('./backtest/orb_engine');
 const sessionBreakoutEngine = require('./backtest/session_breakout_engine');
+const fvgSignal = require('./engine/fvg_signal');
+
+// Validated hourly FVG continuation — the most rigorously validated strategy
+// in this codebase as of the 2026-08 research session (STRATEGY_RESEARCH_LOG.md
+// rounds 4-5): 5/5 walk-forward folds profitable, 92-trade untouched holdout
+// positive, 245 total qualifying trades, and a funded-account Monte Carlo.
+// Config is frozen inside engine/fvg_signal.js (minGap>=50pt, Tue/Wed/Thu,
+// limit entry at the gap edge, stop = far edge + 10% of gap, 1R target).
+const FVG_TRACK_RECORD = 'Hourly FVG continuation (>=50pt 3-bar imbalance, Tue/Wed/Thu, limit at gap edge, 1R target, '
+  + 'stop ~1.1x gap i.e. usually 55-120pts — size DOWN to your fixed dollar risk, the point-width varies by gap): '
+  + 'walk-forward 5/5 folds profitable, untouched 92-trade holdout +0.068R/trade at 57.6% win rate, combined 245 real '
+  + 'trades 58.4% win rate / +0.091R / PF 1.215 / maxDD 7.34R, positive in 2024, 2025 AND 2026 (unlike ORB, whose edge '
+  + 'was concentrated in 2024). Funded-account Monte Carlo (generic illustrative rules, measured 1.32pt spread): '
+  + '87-92% probability of reaching an eval target before failure at 0.75-1% risk under base costs — but FAILS under '
+  + 'adverse/severe cost stress, like every strategy tested. STATUS: DEMO-FIRST. Forward demo performance must confirm '
+  + 'real execution quality before any live capital. Not a guarantee; supported by this historical sample only.';
 
 const SIGNAL_ICT_MIN_LEG  = 199;
 // rangeHour=8/target=1x/slBuffer=0.1/skipMonday — re-validated via walk-forward
@@ -883,6 +899,28 @@ async function handleSignal(req, res) {
       premarket = { bias: 'WAIT', reason: 'premarket signal failed: ' + e.message, trackRecord: PREMARKET_TRACK_RECORD };
     }
 
+    // --- Validated hourly FVG (engine/fvg_signal.js — frozen config) ---
+    // PENDING = the actionable state: the validated entry is a resting limit
+    // at the gap edge placed BEFORE the touch. FIRED = the edge already
+    // traded; chasing after the touch is not the validated entry, shown for
+    // transparency only. Wrapped in try/catch — must never break ict/orb.
+    let fvg = null;
+    try {
+      const s = fvgSignal.currentSignal(bars);
+      if (s.state === 'PENDING') {
+        fvg = { bias: s.bias, state: s.state, entry: s.entry, sl: s.sl, target: s.target,
+          riskPts: s.riskPts, targetPts: s.targetPts, gapLow: s.gapLow, gapHigh: s.gapHigh,
+          waitBarsRemaining: s.waitBarsRemaining, trackRecord: FVG_TRACK_RECORD };
+      } else if (s.state === 'FIRED') {
+        fvg = { bias: 'WAIT', state: s.state, reason: 'gap edge already traded — the validated entry was the resting limit before the touch; do not chase',
+          entry: s.entry, sl: s.sl, target: s.target, trackRecord: FVG_TRACK_RECORD };
+      } else {
+        fvg = { bias: 'WAIT', state: 'NONE', reason: s.reason, trackRecord: FVG_TRACK_RECORD };
+      }
+    } catch (e) {
+      fvg = { bias: 'WAIT', state: 'ERROR', reason: 'fvg signal failed: ' + e.message, trackRecord: FVG_TRACK_RECORD };
+    }
+
     // Confirmation engine is purely additive context — failures here must
     // never take down the ict/orb response those fields already depend on.
     let confirmation = null;
@@ -915,7 +953,19 @@ async function handleSignal(req, res) {
       }
     }
 
-    send(res, 200, { ict, orb, premarket, confirmation, quote: quote.last, asOf: now.time });
+    // FVG journals on its own key (independent of the confirmation engine and
+    // of whether ict/orb/premarket fired — it's a different strategy with its
+    // own cadence). PENDING entries are the demo forward-measurement record
+    // journal_review.js will resolve against real subsequent bars.
+    if (fvg && fvg.bias !== 'WAIT' && fvg.state === 'PENDING') {
+      const fvgKey = `${dateKey}-FVG-${fvg.bias}-${fvg.entry}`;
+      if (shouldLogSignal(dateKey, fvgKey)) {
+        appendToSignalJournal({ time: now.time, checkedAt: Date.now(), quote: quote.last,
+          signals: [{ strategy: 'FVG', bias: fvg.bias, entry: fvg.entry, sl: fvg.sl, target: fvg.target, trackRecord: FVG_TRACK_RECORD }] });
+      }
+    }
+
+    send(res, 200, { ict, orb, premarket, fvg, confirmation, quote: quote.last, asOf: now.time });
   } catch (e) {
     send(res, 500, { error: e.message });
   }
