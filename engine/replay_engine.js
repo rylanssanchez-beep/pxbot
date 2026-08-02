@@ -154,9 +154,20 @@ function swingTrailingStop(barsUpToNow, direction, lookback, currentStop) {
 // costModel:   see DEFAULT_COST_MODEL
 // entryTimeoutBars: for limit/stop orders — bars to wait for a fill before
 //              marking the order missed (never filled, no trade).
+// orderType 'preComputedFill': for strategies whose own entry rule is a
+//              precise zone/level touch rather than "next bar's open" or a
+//              single limit/stop price (e.g. ict_engine.js's OTE-zone touch,
+//              orb_engine.js's exact range-breakout level) — the caller has
+//              already scanned forward and found the exact (entryIndex,
+//              entryPriceRaw) using that strategy's own untouched entry
+//              logic; this engine takes over from there for cost-adjusted
+//              fill + exit simulation only. Requires precomputedEntryIndex/
+//              precomputedEntryPriceRaw. Preserves each frozen strategy's
+//              exact entry-price model instead of forcing every strategy
+//              through one generic fill assumption.
 function simulateTrade({ bars, signalIndex, direction, orderType = 'market', orderPrice = null,
   stopPrice, targetPrice = null, exitPlan = {}, costModel = DEFAULT_COST_MODEL, entryTimeoutBars = 20,
-  ctPartsFn = null }) {
+  ctPartsFn = null, precomputedEntryIndex = null, precomputedEntryPriceRaw = null }) {
   const cm = { ...DEFAULT_COST_MODEL, ...costModel };
   const sign = direction === 'LONG' ? 1 : -1;
 
@@ -165,7 +176,11 @@ function simulateTrade({ bars, signalIndex, direction, orderType = 'market', ord
   const delay = cm.entryDelayBars || 0;
   const searchStart = signalIndex + 1 + delay;
 
-  if (orderType === 'market') {
+  if (orderType === 'preComputedFill') {
+    if (precomputedEntryIndex != null && precomputedEntryIndex < bars.length) {
+      entryIndex = precomputedEntryIndex; entryPriceRaw = precomputedEntryPriceRaw;
+    }
+  } else if (orderType === 'market') {
     if (searchStart < bars.length) { entryIndex = searchStart; entryPriceRaw = bars[searchStart].open; }
   } else {
     // limit / stop: scan forward up to entryTimeoutBars for a touch of orderPrice.
@@ -192,6 +207,7 @@ function simulateTrade({ bars, signalIndex, direction, orderType = 'market', ord
   // --- Walk forward from entry ---
   const partials = [...(exitPlan.partials || [])].sort((a, b) => a.rMultiple - b.rMultiple);
   const taken = new Set();
+  const stepsTaken = new Set();
   let remainingPct = 1.0;
   let realizedRGross = 0;
   let currentStop = stopPrice;
@@ -250,6 +266,26 @@ function simulateTrade({ bars, signalIndex, direction, orderType = 'market', ord
         currentStop = direction === 'LONG' ? Math.max(currentStop, level) : Math.min(currentStop, level);
       }
       if (remainingPct > 1e-9) { exitIndex = null; finalExitPrice = null; exitReason = null; } // position still open — not the final exit after all
+    }
+
+    // Stop-adjustment steps (ladder that moves the stop WITHOUT reducing
+    // position size — e.g. ict_engine.js's real live exit: full position
+    // rides, stop only jumps to breakeven when TP1 prints and to TP1 when
+    // TP2 prints; the only full exit is the stop or the final target). Each
+    // step's newStopPrice ratchets only favorably, same discipline as
+    // trailing. triggerPrice/newStopPrice are literal prices (not
+    // R-multiples) so callers can pass a strategy's own already-computed
+    // price levels directly with zero conversion.
+    if (exitPlan.stopSteps && remainingPct > 1e-9) {
+      for (let si = 0; si < exitPlan.stopSteps.length; si++) {
+        if (stepsTaken.has(si)) continue;
+        const step = exitPlan.stopSteps[si];
+        const hit = direction === 'LONG' ? b.high >= step.triggerPrice : b.low <= step.triggerPrice;
+        if (!hit) continue;
+        stepsTaken.add(si);
+        currentStop = direction === 'LONG' ? Math.max(currentStop, step.newStopPrice) : Math.min(currentStop, step.newStopPrice);
+        stage = step.stageName || 'partial_lock';
+      }
     }
 
     // Single fixed target (non-laddered mode).
