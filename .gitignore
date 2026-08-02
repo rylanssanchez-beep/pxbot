@@ -1,3 +1,16 @@
+# Credentials — never committed. Loaded via scripts/load_env.js at runtime.
+.env
+.env.*
+!.env.example
+
+# Persistent historical market-data store (built by the Part 2 downloader) —
+# large, regenerable from TradeLocker, not source. See DATA_CENTER docs for
+# how to rebuild it from scratch.
+data/*.sqlite
+data/*.sqlite-*
+data/checkpoints/
+data/logs/
+
 # Runtime market-data caches and session state — regenerated on server start, not source
 tick_bars.json
 tv_context.json
