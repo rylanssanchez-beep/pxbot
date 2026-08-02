@@ -29,6 +29,13 @@ function get(p) {
 function loadJournal() { try { return JSON.parse(fs.readFileSync(journalPath, 'utf8')); } catch (_) { return []; } }
 function saveJournal(j) { fs.writeFileSync(journalPath, JSON.stringify(j, null, 2)); }
 
+// Resolves against the breakeven-ladder management plan (stop to entry
+// after TP1, to TP1 after TP2, ride to TP3) — matches
+// ict_engine.js:simulateTradeManaged and server.js's live managementPlan
+// guidance now shown to the user. Duplicated (not imported) because this
+// operates on already-logged journal entries (real bars since the signal
+// fired), not a forward-walk simulation over a fixed bar count — same
+// staged-stop logic, different driving loop.
 function resolveICT(sig, bars) {
   const { levels, bias } = sig;
   let entryIdx = -1, entryPrice = null;
@@ -43,16 +50,22 @@ function resolveICT(sig, bars) {
   if (entryIdx === -1) return { status: 'pending', reason: "price hasn't entered the OTE zone yet" };
   const risk = Math.abs(entryPrice - levels.sl);
   if (risk <= 0) return { status: 'pending', reason: 'invalid risk' };
+
+  let stop = levels.sl, stage = 0; // 0=initial, 1=past TP1 (stop at breakeven), 2=past TP2 (stop at TP1)
+  const r1 = Math.abs(levels.tp1 - entryPrice) / risk;
   for (let i = entryIdx; i < bars.length; i++) {
     const b = bars[i];
-    const hitSL  = bias === 'BUY' ? b.low <= levels.sl : b.high >= levels.sl;
+    const hitStop = bias === 'BUY' ? b.low <= stop : b.high >= stop;
+    if (hitStop) {
+      const r = stage === 0 ? -1 : stage === 1 ? 0 : r1;
+      return { status: 'resolved', outcome: r > 0.001 ? 'win' : (r < -0.001 ? 'loss' : 'breakeven'), r };
+    }
     const hitTP3 = bias === 'BUY' ? b.high >= levels.tp3 : b.low <= levels.tp3;
-    const hitTP2 = bias === 'BUY' ? b.high >= levels.tp2 : b.low <= levels.tp2;
-    const hitTP1 = bias === 'BUY' ? b.high >= levels.tp1 : b.low <= levels.tp1;
-    if (hitSL)  return { status: 'resolved', outcome: 'loss', r: -1 };
     if (hitTP3) return { status: 'resolved', outcome: 'win', r: Math.abs(levels.tp3 - entryPrice) / risk };
-    if (hitTP2) return { status: 'resolved', outcome: 'win', r: Math.abs(levels.tp2 - entryPrice) / risk };
-    if (hitTP1) return { status: 'resolved', outcome: 'win', r: Math.abs(levels.tp1 - entryPrice) / risk };
+    const hitTP2 = bias === 'BUY' ? b.high >= levels.tp2 : b.low <= levels.tp2;
+    if (hitTP2 && stage < 2) { stage = 2; stop = levels.tp1; }
+    const hitTP1 = bias === 'BUY' ? b.high >= levels.tp1 : b.low <= levels.tp1;
+    if (hitTP1 && stage < 1) { stage = 1; stop = entryPrice; }
   }
   return { status: 'pending', reason: 'entered but no target/stop hit yet in available bars' };
 }
@@ -71,11 +84,17 @@ function resolveORB(sig, bars) {
 }
 
 const BACKTESTED = {
-  'ICT-leg-filter': { avgR: 0.405, n: 7, label: 'OOS backtest (thin sample)' },
-  // rangeHour=9/target=0.5x config — folds 1+2 ONLY (both profitable), by
-  // request. Fold 4 picked this same shape and went slightly negative;
-  // excluded here deliberately, not because it was overlooked.
-  'ORB':            { avgR: 0.110, n: 137, label: 'walk-forward folds 1+2 only, both profitable' },
+  // Breakeven-ladder managed exit (server.js:ICT_MANAGEMENT_PLAN). Real
+  // 1-minute-execution OOS test, held-out period stronger than train — but
+  // the same logic on the much bigger hourly-approximated history was
+  // weaker (still negative). Both true; this cites the more-accurate-but-
+  // thinner number since that's what actually matches real fills.
+  'ICT-leg-filter': { avgR: 0.405, n: 7, label: 'real 1m-execution OOS (thin sample; weaker on hourly-approximated full history — see server.js comment)' },
+  // rangeHour=8/target=1x/slBuffer=0.1/skipMonday — picked independently in
+  // 5/5 walk-forward folds (stable signal), 4/5 profitable OOS. Caveat: the
+  // most recent 6-7 weeks tested show decay, currently worse than the prior
+  // config there — see server.js:ORB_TRACK_RECORD for the full picture.
+  'ORB':            { avgR: 0.056, n: 299, label: 'walk-forward 4/5 folds profitable, config picked in every fold; recent-period decay flagged separately' },
 };
 
 // ── Human-in-the-loop confirmation-weight learning ─────────────────────────

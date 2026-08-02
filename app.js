@@ -2866,7 +2866,7 @@ async function runAISignal() {
       json = {
         scenario: ict.scenario, scenario_name: (SCENARIOS[ict.scenario]?.name || ('S' + ict.scenario)) + ' (validated engine)',
         bias: ict.bias, wait_reason: null,
-        entry_window: 'nyopen', entry_window_note: 'ICT leg-filter (leg≥199pt) — enter on the OTE pullback.',
+        entry_window: 'nyopen', entry_window_note: 'ICT leg-filter (leg≥199pt) — enter on the OTE pullback. MANAGED EXIT: ' + (ict.managementPlan || ''),
         ote_entry_low: lv.oteLow, ote_entry_high: lv.oteHigh,
         stop: lv.sl, target: lv.tp2, stop_pts: +risk.toFixed(2), target_pts: +Math.abs(lv.tp2 - entryMid).toFixed(2),
         tp1: lv.tp1, tp2: lv.tp2, tp3: lv.tp3,
@@ -2874,6 +2874,7 @@ async function runAISignal() {
         rr: +(Math.abs(lv.tp2 - entryMid) / Math.max(0.25, risk)).toFixed(1),
         ...confFields,
         reasoning: `Validated ICT leg-filter engine: ${ict.reason}. Track record: ${ict.trackRecord}` + (orbFired ? ` [ORB also fired this bar — see below]` : '')
+          + (ict.managementPlan ? ` | MANAGE THIS TRADE: ${ict.managementPlan}` : '')
           + (conf ? ` | Confirmation engine: ${conf.tier} tier, ${conf.confidence}% confidence (${conf.agreeingCount} agree / ${conf.disagreeingCount} disagree) — context only, not a live-validated gate yet.` : ''),
         invalidation: lv.sl,
       };

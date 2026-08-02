@@ -548,10 +548,24 @@ const ictEngine = require('./backtest/ict_engine');
 const orbEngine = require('./backtest/orb_engine');
 
 const SIGNAL_ICT_MIN_LEG  = 199;
-const SIGNAL_ORB_CONFIG   = { ...orbEngine.DEFAULT_ORB, rangeHour: 9, targetMultiple: 0.5, slBufferPct: 0.05, minRangeSize: 100 };
-const ICT_TRACK_RECORD = 'leg>=199pt filter: +0.349R avg train (n=18), +0.405R avg OOS (n=7) — thin sample, not proven.';
-const ORB_TRACK_RECORD = 'rangeHour=9/target=0.5x, folds 1+2 only (both profitable): +0.110R/trade combined (n=137). '
-  + 'Fold 4 picked this same shape and went slightly negative (-0.025R, n=80) — excluded here by request, not silently.';
+// rangeHour=8/target=1x/slBuffer=0.1/skipMonday — re-validated via walk-forward
+// (backtest/orb_walkforward.js) after real 1m-execution data showed the OLD
+// rangeHour=9/target=0.5x config had a payoff-asymmetry problem (target
+// smaller than stop, needing an unrealistic win rate to break even) and that
+// Monday specifically dragged combined performance (avgR -0.275, n=25, 28%
+// win vs Tue/Thu's 60%+). This exact config was picked independently in
+// EVERY walk-forward fold (5/5) — a stable signal, not noise.
+const SIGNAL_ORB_CONFIG   = { ...orbEngine.DEFAULT_ORB, rangeHour: 8, targetMultiple: 1, slBufferPct: 0.1, minRangeSize: 100, allowedDaysOfWeek: [0, 2, 3, 4, 5, 6] };
+const ICT_TRACK_RECORD = 'leg>=199pt filter, MANAGED exit (breakeven ladder — see reasoning): real 1-minute-execution '
+  + 'out-of-sample TRAIN avgR 0.314 (n=11), TEST avgR 0.405 (n=7, held out, most recent period, stronger than train). '
+  + 'Caveat: the same logic checked against the much larger 2.3-year hourly-approximated history was far weaker '
+  + '(avgR -0.068 -> -0.053, still negative) — hourly bars can\'t resolve the exact order TP1/stop are hit within an '
+  + 'hour, so that check is less accurate for this specific staged-exit logic, but it is a vastly bigger sample. Both results are real; neither is hidden.';
+const ORB_TRACK_RECORD = 'rangeHour=8/target=1x/slBuffer=0.1/skipMonday: walk-forward 4/5 folds profitable (vs 2/5 for '
+  + 'the prior rangeHour=9/target=0.5x config), combined OOS +16.81R over 299 trades (avg +0.056R/trade), and this '
+  + 'exact config was picked independently in every fold. Caveat: within the most recent fold, performance decayed '
+  + 'over time and the last ~6-7 weeks tested currently do WORSE than the prior live config (-0.11R vs -0.029R avg) — '
+  + 'a real recent-period risk, not hidden.';
 
 // ── Confirmation Engine — ADDITIVE ONLY ────────────────────────────────────
 // Fractal/MTF/regime/confluence context (engine/*.js) attached alongside
@@ -702,7 +716,7 @@ function appendToSignalJournal(entry) {
 
 function signalCtParts(unixSecs) {
   const d = new Date(new Date(unixSecs * 1000).toLocaleString('en-US', { timeZone: 'America/Chicago' }));
-  return { hour: d.getHours() + d.getMinutes() / 60, dateKey: d.toISOString().slice(0, 10) };
+  return { hour: d.getHours() + d.getMinutes() / 60, dateKey: d.toISOString().slice(0, 10), dow: d.getDay() };
 }
 
 async function handleSignal(req, res) {
@@ -716,6 +730,14 @@ async function handleSignal(req, res) {
       loopbackGet('/api/quote'),
     ]);
     if (!h1.bars || !h1.bars.length) return send(res, 200, { ict: null, orb: null, error: 'No candle data yet.' });
+    // Pre-existing latent bug, found while validating this session's changes:
+    // right after a server restart, latestQuote starts at {last:0,...} until
+    // the first quote poll completes. Without this guard, ORB's breakout
+    // check (`quote.last < rangeBar.low`) is trivially true for quote=0
+    // against any real price, producing a bogus SELL signal. Not something
+    // this session introduced, but a real correctness issue for a system
+    // meant to guide real capital — fixed here rather than left for later.
+    if (!quote.last || quote.last <= 0) return send(res, 200, { ict: null, orb: null, confirmation: null, error: 'No valid quote yet — server likely just started, quote stream still warming up.' });
 
     const bars = h1.bars;
     const now  = bars[bars.length - 1];
@@ -730,13 +752,22 @@ async function handleSignal(req, res) {
         else if (p.hour >= 1 && p.hour < 7) londonBars.push(b);
       }
     }
+    // PXBOT is manual-execution — no order-placement path exists — so
+    // "shipping" the breakeven-ladder exit means telling the human exactly
+    // how to manage the trade, not just showing static levels. This is the
+    // SAME levels (oteLow/oteHigh/sl/tp1/tp2/tp3) as before; only the
+    // management instructions are new.
+    const ICT_MANAGEMENT_PLAN = 'Move stop to entry (breakeven) once TP1 prints. Move stop to TP1 once TP2 prints. '
+      + 'Ride the remainder for TP3. Do not close fully at TP1/TP2 — that is the OLD exit this replaces, and it tested '
+      + 'worse (see trackRecord).';
+
     let ict = null;
     if (asiaBars.length && londonBars.length) {
       const th = { ...ictEngine.DEFAULT_THRESHOLDS, minLegSize: SIGNAL_ICT_MIN_LEG };
       const cls = ictEngine.classifyDay(asiaBars, londonBars, th);
       if (cls.id !== 0 && cls.id !== 4) {
         const levels = ictEngine.legLevels(cls.bias, cls.legLow, cls.legHigh, th);
-        ict = { scenario: cls.id, bias: cls.bias, reason: cls.reason, levels, trackRecord: ICT_TRACK_RECORD };
+        ict = { scenario: cls.id, bias: cls.bias, reason: cls.reason, levels, managementPlan: ICT_MANAGEMENT_PLAN, trackRecord: ICT_TRACK_RECORD };
       } else {
         ict = { scenario: cls.id, bias: 'WAIT', reason: cls.reason, trackRecord: ICT_TRACK_RECORD };
       }
@@ -744,8 +775,13 @@ async function handleSignal(req, res) {
 
     // --- ORB ---
     let orb = null;
-    const rangeBar = bars.slice(-30).find(b => { const p = signalCtParts(b.time); return p.dateKey === dateKey && Math.floor(p.hour) === SIGNAL_ORB_CONFIG.rangeHour; });
-    if (rangeBar) {
+    const todayDow = signalCtParts(now.time).dow;
+    const rangeBar = SIGNAL_ORB_CONFIG.allowedDaysOfWeek.includes(todayDow)
+      ? bars.slice(-30).find(b => { const p = signalCtParts(b.time); return p.dateKey === dateKey && Math.floor(p.hour) === SIGNAL_ORB_CONFIG.rangeHour; })
+      : null;
+    if (!SIGNAL_ORB_CONFIG.allowedDaysOfWeek.includes(todayDow)) {
+      orb = { bias: 'WAIT', reason: 'day-of-week filter: Monday excluded (real evidence showed avgR -0.275, 28% win rate — see trackRecord)', trackRecord: ORB_TRACK_RECORD };
+    } else if (rangeBar) {
       const size = rangeBar.high - rangeBar.low;
       if (hour <= SIGNAL_ORB_CONFIG.rangeHour + 1) {
         orb = { bias: 'WAIT', reason: 'still inside the range hour', rangeBar, trackRecord: ORB_TRACK_RECORD };
