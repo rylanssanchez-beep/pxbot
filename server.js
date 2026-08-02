@@ -553,6 +553,106 @@ const ICT_TRACK_RECORD = 'leg>=199pt filter: +0.349R avg train (n=18), +0.405R a
 const ORB_TRACK_RECORD = 'rangeHour=9/target=0.5x, folds 1+2 only (both profitable): +0.110R/trade combined (n=137). '
   + 'Fold 4 picked this same shape and went slightly negative (-0.025R, n=80) — excluded here by request, not silently.';
 
+// ── Confirmation Engine — ADDITIVE ONLY ────────────────────────────────────
+// Fractal/MTF/regime/confluence context (engine/*.js) attached alongside
+// ict/orb, never altering them. Explicitly NOT gating any trade yet: a live
+// walk-forward check on this account's real history (Aug 2026) found ICT's
+// leg>=199pt filter is currently NOT showing a validated edge (-0.068R avg,
+// 1/5 walk-forward folds profitable — the documented +0.405R OOS above was a
+// thin n=7 sample that hasn't held up), and ORB's edge, while real, is
+// thinner than originally documented (+0.068R avg live vs the +0.110R this
+// config was tuned on). The confirmation tiers DID track real expectancy
+// monotonically on that same live run (skip 0.004R -> B 0.066R -> A 0.111R
+// -> A+ 0.144R) but per-fold sample sizes (as low as n=8) are still too thin
+// to trust as a live gate. So: surfaced for visibility now, gating is a
+// later, separate decision once more live confirmation-vs-outcome data
+// accumulates (see backtest/journal_review.js's planned factor-correlation
+// analysis).
+const fractalEngine = require('./engine/fractal_engine');
+const mtfEngine = require('./engine/mtf_engine');
+const confirmationEngine = require('./engine/confirmation_engine');
+
+function loadConfirmationWeights() {
+  try {
+    const raw = fs.readFileSync(path.join(ROOT, 'engine', 'confirmation_weights.json'), 'utf8');
+    const parsed = JSON.parse(raw);
+    return parsed.weights || confirmationEngine.DEFAULT_WEIGHTS;
+  } catch (_) {
+    return confirmationEngine.DEFAULT_WEIGHTS;
+  }
+}
+
+// Same hourly->daily/4H aggregation approach validated in
+// backtest/confirmation_backtest.js — kept here rather than shared since one
+// is a live-request helper and the other an offline-backtest helper with
+// different bar-count/perf tradeoffs, but the algorithm is identical.
+function hourlyToDaily(bars) {
+  const byDate = new Map();
+  for (const b of bars) {
+    const key = signalCtParts(b.time).dateKey;
+    if (!byDate.has(key)) byDate.set(key, []);
+    byDate.get(key).push(b);
+  }
+  const out = [];
+  for (const chunk of byDate.values()) {
+    out.push({ time: chunk[0].time, open: chunk[0].open, close: chunk[chunk.length - 1].close,
+      high: Math.max(...chunk.map(b => b.high)), low: Math.min(...chunk.map(b => b.low)),
+      volume: chunk.reduce((a, b) => a + (b.volume || 0), 0) });
+  }
+  out.sort((a, b) => a.time - b.time);
+  return out;
+}
+function hourlyToH4(bars) {
+  const out = [];
+  for (let i = 0; i < bars.length; i += 4) {
+    const chunk = bars.slice(i, i + 4);
+    if (!chunk.length) continue;
+    out.push({ time: chunk[0].time, open: chunk[0].open, close: chunk[chunk.length - 1].close,
+      high: Math.max(...chunk.map(b => b.high)), low: Math.min(...chunk.map(b => b.low)),
+      volume: chunk.reduce((a, b) => a + (b.volume || 0), 0) });
+  }
+  return out;
+}
+
+// Computes the confirmation report for whichever of ict/orb actually fired.
+// Wrapped by the caller in try/catch — a failure here must never break the
+// ict/orb response those fields already depend on.
+async function computeSignalConfirmation(ict, orb, quote, hourlyBars) {
+  const ictFired = ict && ict.bias !== 'WAIT';
+  const orbFired = orb && orb.bias !== 'WAIT';
+  if (!ictFired && !orbFired) return null;
+
+  // Same priority ICT-over-ORB the UI already uses (app.js:runAISignal).
+  const bias = ictFired ? ict.bias : orb.bias;
+  const entryZone = ictFired
+    ? { low: ict.levels.oteLow, high: ict.levels.oteHigh }
+    : (() => { const size = orb.rangeBar.high - orb.rangeBar.low; return { low: Math.min(orb.entry, orb.entry - size * 0.1), high: Math.max(orb.entry, orb.entry + size * 0.1) }; })();
+
+  const recentExecution = hourlyBars.slice(-200);
+  const [m5, m15, h4data, d1data] = await Promise.all([
+    loopbackGet('/api/candles?resolution=5&count=300'),
+    loopbackGet('/api/candles?resolution=15&count=300'),
+    loopbackGet('/api/candles?resolution=240&count=500'),
+    loopbackGet('/api/candles?resolution=1440&count=250'),
+  ]);
+  const daily = (d1data.bars && d1data.bars.length) ? d1data.bars : hourlyToDaily(hourlyBars);
+  const h4 = (h4data.bars && h4data.bars.length) ? h4data.bars : hourlyToH4(hourlyBars);
+  const barsByTF = {
+    m5: m5.bars || [], m15: m15.bars || [], h1: recentExecution, h4, d1: daily,
+    weekly: fractalEngine.aggregateToTimeframe(daily, 'week'),
+    monthly: fractalEngine.aggregateToTimeframe(daily, 'month'),
+  };
+
+  const weights = loadConfirmationWeights();
+  const report = confirmationEngine.computeConfirmation({
+    bias, quote, entryZone, executionBars: recentExecution, barsByTF,
+    ictResult: ictFired ? { bias: ict.bias } : null,
+    orbResult: orbFired ? { bias: orb.bias } : null,
+  }, weights);
+
+  return { ...report, note: 'Context only — does NOT gate ict/orb above. See server.js comment above computeSignalConfirmation for why gating is deferred.' };
+}
+
 function signalCtParts(unixSecs) {
   const d = new Date(new Date(unixSecs * 1000).toLocaleString('en-US', { timeZone: 'America/Chicago' }));
   return { hour: d.getHours() + d.getMinutes() / 60, dateKey: d.toISOString().slice(0, 10) };
@@ -617,7 +717,16 @@ async function handleSignal(req, res) {
       }
     }
 
-    send(res, 200, { ict, orb, quote: quote.last, asOf: now.time });
+    // Confirmation engine is purely additive context — failures here must
+    // never take down the ict/orb response those fields already depend on.
+    let confirmation = null;
+    try {
+      confirmation = await computeSignalConfirmation(ict, orb, quote.last, bars);
+    } catch (e) {
+      confirmation = { error: 'confirmation engine failed: ' + e.message };
+    }
+
+    send(res, 200, { ict, orb, confirmation, quote: quote.last, asOf: now.time });
   } catch (e) {
     send(res, 500, { error: e.message });
   }
