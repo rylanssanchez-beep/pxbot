@@ -21,3 +21,4 @@ backtest/stress_test_synthetic_results.json
 backtest/confirmation_backtest_finegrain_results.json
 engine/confirmation_weights.proposed.json
 backtest/vwap_reversion_results.json
+backtest/trend_pullback_results.json
