@@ -87,11 +87,16 @@ function ctYearKey(unixSecs) {
 
 // trades: array of { rMultiple, rMultipleGross, maeR, mfeR, holdingBars,
 //   entryTime, exitTime, filled, direction, ambiguousFill, commissionCostR }
-// opts: { barMinutes: execution bar size in minutes, for converting
-//   holdingBars to wall-clock time; totalPeriodDays: span of the tested
-//   window, for exposure/Calmar annualization. }
+// opts: { totalPeriodDays: span of the tested window, for exposure/Calmar
+//   annualization. } Wall-clock holding time is computed directly from
+//   exitTime-entryTime (always correct regardless of execution resolution)
+//   rather than holdingBars * an assumed bar size — holdingBars is bar-count
+//   units specific to whatever resolution that trade executed at (1-minute
+//   for one strategy, 1-hour for another), so multiplying by one shared
+//   "barMinutes" silently corrupts exposure/holding-time whenever trades
+//   from different execution resolutions are combined in one call (exactly
+//   what happens for the cross-strategy overall/session/year breakdowns).
 function computeMetrics(allTrades, opts = {}) {
-  const barMinutes = opts.barMinutes || 1;
   const totalPeriodDays = opts.totalPeriodDays || null;
 
   const filled = allTrades.filter(t => t.filled);
@@ -133,6 +138,7 @@ function computeMetrics(allTrades, opts = {}) {
   const payoffRatio = (avgWinR && avgLossR) ? +(avgWinR / Math.abs(avgLossR)).toFixed(3) : null;
 
   const holdingBarsArr = clean.map(t => t.holdingBars).filter(h => h != null);
+  const holdingMinutesArr = clean.map(t => (t.exitTime != null && t.entryTime != null) ? (t.exitTime - t.entryTime) / 60 : null).filter(v => v != null);
   const maeRArr = clean.map(t => t.maeR).filter(v => v != null);
   const mfeRArr = clean.map(t => t.mfeR).filter(v => v != null);
 
@@ -158,9 +164,9 @@ function computeMetrics(allTrades, opts = {}) {
   const profitableMonths = [...byMonth.values()].filter(r => r > 0).length;
   const profitableWeeks = [...byWeek.values()].filter(r => r > 0).length;
 
-  // Exposure: sum of holding time (in the execution bar's real minutes) /
-  // total elapsed calendar minutes of the tested window.
-  const totalHoldingMinutes = holdingBarsArr.reduce((a, b) => a + b, 0) * barMinutes;
+  // Exposure: sum of real wall-clock holding time / total elapsed calendar
+  // minutes of the tested window.
+  const totalHoldingMinutes = holdingMinutesArr.reduce((a, b) => a + b, 0);
   const exposure = totalPeriodDays ? +((totalHoldingMinutes / (totalPeriodDays * 24 * 60)) * 100).toFixed(2) : null;
 
   const totalCommissionR = clean.reduce((a, t) => a + (t.commissionCostR || 0), 0);
@@ -191,9 +197,9 @@ function computeMetrics(allTrades, opts = {}) {
     maxConsecutiveWins: maxStreak(clean, isWin),
     maxConsecutiveLosses: maxStreak(clean, isLoss),
     avgHoldingBars: mean(holdingBarsArr) !== null ? +mean(holdingBarsArr).toFixed(1) : null,
-    avgHoldingMinutes: mean(holdingBarsArr) !== null ? +(mean(holdingBarsArr) * barMinutes).toFixed(1) : null,
+    avgHoldingMinutes: mean(holdingMinutesArr) !== null ? +mean(holdingMinutesArr).toFixed(1) : null,
     maxHoldingBars: holdingBarsArr.length ? Math.max(...holdingBarsArr) : null,
-    maxHoldingMinutes: holdingBarsArr.length ? Math.max(...holdingBarsArr) * barMinutes : null,
+    maxHoldingMinutes: holdingMinutesArr.length ? +Math.max(...holdingMinutesArr).toFixed(1) : null,
     avgMaeR: mean(maeRArr) !== null ? +mean(maeRArr).toFixed(3) : null,
     avgMfeR: mean(mfeRArr) !== null ? +mean(mfeRArr).toFixed(3) : null,
     p75MaeR: +((percentile(maeRArr, 0.75) ?? 0)).toFixed(3),

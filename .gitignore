@@ -39,3 +39,4 @@ backtest/session_breakout_results.json
 backtest/ict_scenario_isolation_results.json
 backtest/session_breakout_regime_results.json
 backtest/session_alt_strategies_results.json
+backtest/baseline_report_*.json
