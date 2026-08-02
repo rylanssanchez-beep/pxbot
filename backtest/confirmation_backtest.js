@@ -104,7 +104,7 @@ function truncate(bars, cutoffTime) {
   return idx === -1 ? bars : bars.slice(0, idx);
 }
 
-function scoreTrade(bias, quote, entryZone, executionBarsFull, cutoffTime, ictResult, orbResult) {
+function scoreTrade(bias, quote, entryZone, executionBarsFull, cutoffTime, ictResult, orbResult, weights) {
   const availableBars = truncate(executionBarsFull, cutoffTime);
   if (availableBars.length < 60) return null; // not enough history yet for a meaningful MTF read
   // Execution-bar detectors (VWAP/FVG/OB/displacement/sweep) use a bounded
@@ -119,12 +119,18 @@ function scoreTrade(bias, quote, entryZone, executionBarsFull, cutoffTime, ictRe
   const weekly = fractalEngine.aggregateToTimeframe(daily, 'week');
   const monthly = fractalEngine.aggregateToTimeframe(daily, 'month');
   const barsByTF = { h1: recentExecution, h4, d1: daily, weekly, monthly };
-  return confirmationEngine.computeConfirmation({ bias, quote, entryZone, executionBars: recentExecution, barsByTF, ictResult, orbResult });
+  return confirmationEngine.computeConfirmation({ bias, quote, entryZone, executionBars: recentExecution, barsByTF, ictResult, orbResult }, weights);
 }
 
+// weights: optional — defaults to confirmationEngine.DEFAULT_WEIGHTS (same
+// as before this parameter existed, so existing callers/results are
+// unaffected). Pass the active or a proposed engine/confirmation_weights.json
+// to actually test THOSE weights instead of the hardcoded equal baseline —
+// needed by backtest/apply_weights.js to compare current vs. proposed.
 function runConfirmationBacktest(bars, opts = {}) {
   const ictTh = { ...ictEngine.DEFAULT_THRESHOLDS, minLegSize: opts.ictMinLegSize ?? 199 };
   const orbTh = { ...orbEngine.DEFAULT_ORB, rangeHour: 9, targetMultiple: 0.5, slBufferPct: 0.05, minRangeSize: 100 };
+  const weights = opts.weights || confirmationEngine.DEFAULT_WEIGHTS;
 
   const results = [];
 
@@ -142,7 +148,7 @@ function runConfirmationBacktest(bars, opts = {}) {
 
     const decisionTime = sess.london[sess.london.length - 1].time;
     const entryZone = { low: levels.oteLow, high: levels.oteHigh };
-    const report = scoreTrade(cls.bias, sim.entryPrice, entryZone, bars, decisionTime, { bias: cls.bias }, null);
+    const report = scoreTrade(cls.bias, sim.entryPrice, entryZone, bars, decisionTime, { bias: cls.bias }, null, weights);
     if (!report) continue;
 
     const r = sim.result === 'SL' ? -1 : (sim.result === 'TIMEOUT' ? 0 : Number(sim.r) || 0);
@@ -160,7 +166,7 @@ function runConfirmationBacktest(bars, opts = {}) {
     const size = entry.rangeBar.high - entry.rangeBar.low;
     const entryPrice = sim.bias === 'BUY' ? entry.rangeBar.high : entry.rangeBar.low;
     const entryZone = { low: Math.min(entryPrice, entryPrice - size * 0.1), high: Math.max(entryPrice, entryPrice + size * 0.1) };
-    const report = scoreTrade(sim.bias, entryPrice, entryZone, bars, decisionTime, null, { bias: sim.bias });
+    const report = scoreTrade(sim.bias, entryPrice, entryZone, bars, decisionTime, null, { bias: sim.bias }, weights);
     if (!report) continue;
 
     results.push({ date: dateKey, strategy: 'ORB', bias: sim.bias, tier: report.tier, confidence: report.confidence, agreeingCount: report.agreeingCount, r: sim.r, result: sim.exit, time: decisionTime });

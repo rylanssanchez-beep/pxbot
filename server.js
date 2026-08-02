@@ -684,6 +684,22 @@ async function computeSignalConfirmation(ict, orb, quote, hourlyBars) {
   return { ...report, note: 'Context only — does NOT gate ict/orb above. See server.js comment above computeSignalConfirmation for why gating is deferred.' };
 }
 
+let _loggedSignalsState = { dateKey: null, keys: new Set() };
+function shouldLogSignal(dateKey, key) {
+  if (_loggedSignalsState.dateKey !== dateKey) _loggedSignalsState = { dateKey, keys: new Set() };
+  if (_loggedSignalsState.keys.has(key)) return false;
+  _loggedSignalsState.keys.add(key);
+  return true;
+}
+
+function appendToSignalJournal(entry) {
+  const journalPath = path.join(ROOT, 'backtest', 'signal_journal.json');
+  let journal = [];
+  try { journal = JSON.parse(fs.readFileSync(journalPath, 'utf8')); } catch (_) {}
+  journal.push(entry);
+  fs.writeFileSync(journalPath, JSON.stringify(journal, null, 2));
+}
+
 function signalCtParts(unixSecs) {
   const d = new Date(new Date(unixSecs * 1000).toLocaleString('en-US', { timeZone: 'America/Chicago' }));
   return { hour: d.getHours() + d.getMinutes() / 60, dateKey: d.toISOString().slice(0, 10) };
@@ -755,6 +771,26 @@ async function handleSignal(req, res) {
       confirmation = await computeSignalConfirmation(ict, orb, quote.last, bars);
     } catch (e) {
       confirmation = { error: 'confirmation engine failed: ' + e.message };
+    }
+
+    // Live signals now get logged too — previously only signal_now.js's CLI
+    // wrote to signal_journal.json, so the "self-adaptation loop"
+    // (journal_review.js) had no live-server sample to learn from at all.
+    // Same schema signal_now.js already uses (so journal_review.js's
+    // existing resolveICT/resolveORB work unmodified on these entries too),
+    // plus the new `confirmation` field attached per-signal. Deduped per
+    // (day, strategy, scenario/bias) so repeated polls of the same fired
+    // signal don't spam the journal with near-duplicates.
+    if (confirmation && !confirmation.error) {
+      const ictFiredNow = ict && ict.bias !== 'WAIT';
+      const orbFiredNow = orb && orb.bias !== 'WAIT';
+      const logKey = ictFiredNow ? `${dateKey}-ICT-${ict.scenario}-${ict.bias}` : (orbFiredNow ? `${dateKey}-ORB-${orb.bias}` : null);
+      if (logKey && shouldLogSignal(dateKey, logKey)) {
+        const signals = [];
+        if (ictFiredNow) signals.push({ strategy: 'ICT-leg-filter', scenario: ict.scenario, bias: ict.bias, levels: ict.levels, trackRecord: ICT_TRACK_RECORD, confirmation });
+        else if (orbFiredNow) signals.push({ strategy: 'ORB', bias: orb.bias, entry: orb.entry, sl: orb.sl, target: orb.target, trackRecord: ORB_TRACK_RECORD, confirmation });
+        appendToSignalJournal({ time: now.time, checkedAt: Date.now(), quote: quote.last, signals });
+      }
     }
 
     send(res, 200, { ict, orb, confirmation, quote: quote.last, asOf: now.time });

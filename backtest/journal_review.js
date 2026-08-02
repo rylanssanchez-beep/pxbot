@@ -10,8 +10,11 @@
 const fs   = require('fs');
 const path = require('path');
 const http = require('http');
+const confirmationEngine = require('../engine/confirmation_engine');
 
 const journalPath = path.join(__dirname, 'signal_journal.json');
+const weightsPath = path.join(__dirname, '..', 'engine', 'confirmation_weights.json');
+const proposedWeightsPath = path.join(__dirname, '..', 'engine', 'confirmation_weights.proposed.json');
 
 function get(p) {
   return new Promise((resolve, reject) => {
@@ -75,6 +78,100 @@ const BACKTESTED = {
   'ORB':            { avgR: 0.110, n: 137, label: 'walk-forward folds 1+2 only, both profitable' },
 };
 
+// ── Human-in-the-loop confirmation-weight learning ─────────────────────────
+// The evidence-based half of "self-adaptation": per-confirmation-factor
+// win-rate/expectancy correlation, computed from real resolved live signals
+// (server.js now logs every fired signal's full confirmation report — see
+// server.js:appendToSignalJournal). This NEVER writes to the active
+// engine/confirmation_weights.json — only to a separate *.proposed.json
+// file. Promoting proposed -> active requires a human to run
+// backtest/apply_weights.js deliberately; nothing here auto-applies
+// anything, per explicit instruction.
+const MIN_SAMPLES_PER_SIDE = 10; // minimum resolved signals on EACH side (agree/disagree) before a factor's weight is touched at all
+const WEIGHT_MIN = 0.25, WEIGHT_MAX = 2.5;
+
+function reviewConfirmationFactors(journal) {
+  const byFactor = {}; // name -> { agree: {n,wins,totalR}, disagree: {n,wins,totalR} }
+  let resolvedWithConfirmation = 0;
+
+  for (const entry of journal) {
+    for (const sig of entry.signals) {
+      if (!sig.outcome || !sig.confirmation || !Array.isArray(sig.confirmation.factors)) continue;
+      resolvedWithConfirmation++;
+      const r = sig.actualR;
+      for (const f of sig.confirmation.factors) {
+        if (f.excluded || f.agrees === null || f.agrees === undefined) continue;
+        if (!byFactor[f.name]) byFactor[f.name] = { agree: { n: 0, wins: 0, totalR: 0 }, disagree: { n: 0, wins: 0, totalR: 0 } };
+        const bucket = byFactor[f.name][f.agrees ? 'agree' : 'disagree'];
+        bucket.n++;
+        bucket.totalR += r;
+        if (r > 0.001) bucket.wins++;
+      }
+    }
+  }
+
+  console.log('=== CONFIRMATION-ENGINE FACTOR REVIEW ===');
+  console.log(`${resolvedWithConfirmation} resolved signals carry a confirmation report to analyze.`);
+  if (resolvedWithConfirmation < MIN_SAMPLES_PER_SIDE * 2) {
+    console.log(`Well below a usable sample (need roughly ${MIN_SAMPLES_PER_SIDE * 2}+) — no per-factor analysis or weight proposal yet. This is expected early on; keep running signal checks and re-run this periodically.\n`);
+    return;
+  }
+
+  let currentWeights = confirmationEngine.DEFAULT_WEIGHTS;
+  try { currentWeights = JSON.parse(fs.readFileSync(weightsPath, 'utf8')).weights || currentWeights; } catch (_) {}
+
+  const proposedWeights = { ...currentWeights };
+  const factorReport = {};
+  let anyAdjusted = false;
+
+  for (const [name, buckets] of Object.entries(byFactor)) {
+    const { agree, disagree } = buckets;
+    const agreeAvgR = agree.n ? agree.totalR / agree.n : null;
+    const disagreeAvgR = disagree.n ? disagree.totalR / disagree.n : null;
+    const current = currentWeights[name] ?? 1;
+    let proposed = current;
+    let note = 'not enough samples on both sides yet — weight unchanged';
+
+    if (agree.n >= MIN_SAMPLES_PER_SIDE && disagree.n >= MIN_SAMPLES_PER_SIDE) {
+      const separation = agreeAvgR - disagreeAvgR;
+      // Simple, auditable step function — NOT a continuous fitted formula.
+      // Evidence tiers, not invented magic numbers: how far apart is
+      // "this factor agreed" vs "this factor disagreed" in real outcome R.
+      let step = 0;
+      if (separation > 0.15) step = 0.5;
+      else if (separation > 0) step = 0.25;
+      else if (separation > -0.15) step = -0.25;
+      else step = -0.5;
+      proposed = Math.max(WEIGHT_MIN, Math.min(WEIGHT_MAX, current + step));
+      note = `separation=${separation.toFixed(3)}R -> step ${step >= 0 ? '+' : ''}${step}`;
+      if (proposed !== current) anyAdjusted = true;
+    }
+
+    proposedWeights[name] = +proposed.toFixed(2);
+    factorReport[name] = { agreeN: agree.n, agreeAvgR: agreeAvgR !== null ? +agreeAvgR.toFixed(3) : null,
+      disagreeN: disagree.n, disagreeAvgR: disagreeAvgR !== null ? +disagreeAvgR.toFixed(3) : null,
+      currentWeight: current, proposedWeight: +proposed.toFixed(2), note };
+    console.log(`  ${name}: agree n=${agree.n} avgR=${factorReport[name].agreeAvgR ?? 'n/a'} | disagree n=${disagree.n} avgR=${factorReport[name].disagreeAvgR ?? 'n/a'} | weight ${current} -> ${factorReport[name].proposedWeight} (${note})`);
+  }
+
+  if (!anyAdjusted) {
+    console.log('\nNo factor has enough samples on both sides to justify a weight change yet — no proposal written.\n');
+    return;
+  }
+
+  const proposal = {
+    generatedAt: new Date().toISOString(),
+    basedOnResolvedSignals: resolvedWithConfirmation,
+    minSamplesPerSide: MIN_SAMPLES_PER_SIDE,
+    currentWeights, proposedWeights, factorReport,
+    note: 'PROPOSAL ONLY — never auto-applied. Review the per-factor evidence above, then run backtest/apply_weights.js '
+      + 'if you want to promote this to the active engine/confirmation_weights.json. That script also re-validates with '
+      + 'confirmation_backtest.js before letting you confirm.',
+  };
+  fs.writeFileSync(proposedWeightsPath, JSON.stringify(proposal, null, 2));
+  console.log(`\nProposed weight changes written to engine/confirmation_weights.proposed.json (NOT active — review, then run backtest/apply_weights.js to promote).\n`);
+}
+
 (async () => {
   const health = await get('/api/health');
   if (!health.authenticated) { console.error('Not connected to TradeLocker — log in via the app UI first.'); process.exit(1); }
@@ -107,6 +204,8 @@ const BACKTESTED = {
   }
   saveJournal(journal);
   console.log(`\n${resolvedNow} newly resolved automatically, ${stillPending} still pending (need more real bars to pass before they can resolve).\n`);
+
+  reviewConfirmationFactors(journal);
 
   // --- Summary: live performance vs the original backtest, per strategy ---
   const byStrategy = {};

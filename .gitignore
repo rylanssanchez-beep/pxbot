@@ -19,3 +19,4 @@ backtest/montecarlo_synthetic_results.json
 backtest/stress_test_results.json
 backtest/stress_test_synthetic_results.json
 backtest/confirmation_backtest_finegrain_results.json
+engine/confirmation_weights.proposed.json
