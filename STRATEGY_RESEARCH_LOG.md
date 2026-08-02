@@ -171,6 +171,58 @@ verdict, exactly the language Part 9 asks for. Revisit once either (a) more cale
 accumulated in the real dataset, or (b) the holdout window is deliberately shrunk in a way that's
 still methodologically defensible (would need justification, not just moved until it passes).
 
+## Round 4 — two more strategy families (Fair Value Gaps, ORB-failure fade)
+
+**Reproduce:** `node backtest/research_phase5.js --only=fvg_continuation,orb_failure_fade`
+
+Per continued request to keep searching new families while refining ORB: `fvg_continuation` (Part
+1's own candidate list — an objective 3-bar imbalance pattern, betting the gap acts as
+support/resistance on a retrace-and-continue) and `orb_failure_fade` (the direct complement to ORB:
+when the opening-range breakout FAILS and price closes back inside the range, fade toward the
+opposite side, instead of ORB's continuation bet — reuses ORB's own range definition so only that
+one variable changes).
+
+| Candidate | Folds profitable | Trades | Win rate | RR (payoff) | Expectancy | Profit factor | Verdict |
+|---|---|---|---|---|---|---|---|
+| fvg_continuation | **4/5** (a real majority) | 190 | 51.58% | 1.072 | +0.0695R | 1.142 | REJECTED — only on the stability gate (config repeated in just 2/5 folds) |
+| orb_failure_fade | 0/5 | 179 | 16.20% | 0.881 | -0.7372R | 0.170 | REJECTED — clearly, consistently negative |
+
+**fvg_continuation is the closest call of any candidate tested this session** — a genuine majority
+of folds were profitable with real, plausible numbers (PF 1.142, n=190), but the specific parameters
+that worked kept drifting fold to fold. Worth a narrower, more targeted grid in a future round
+(fewer, more surgical parameter choices around gap size and target multiple) rather than dismissed.
+
+**orb_failure_fade is useful negative evidence, not a wasted test**: failed ORB breakouts do NOT
+reliably reverse — if anything this reinforces confidence in ORB's own continuation logic being the
+right read of this instrument's behavior at the open, not an arbitrary choice.
+
+## Consolidated final tally — all 12 candidates tested this session
+
+(Corrected for the ledger-duplication and END_OF_DATA gating bugs found and fixed mid-session — see
+git history. Numbers below are the final, doubly-verified figures; a few shifted by 1-2 trades from
+earlier round reports as a result, none materially.)
+
+| # | Candidate | Trades (OOS) | Win rate | RR | Expectancy | PF | Verdict |
+|---|---|---|---|---|---|---|---|
+| 1 | trend_pullback | 29 | 48.28% | 1.157 | +0.0348R | 1.08 | Rejected — not a fold majority |
+| 2 | vwap_reversion | 72 | 56.94% | 2.915 | +1.2952R | 3.856 | Rejected — unstable (overfitting signature) |
+| 3 | liquidity_sweep_asia | 312 | 16.35% | 0.842 | -0.7837R | 0.165 | Rejected — stably negative |
+| 4 | liquidity_sweep_london | 272 | 13.97% | 0.692 | -0.8305R | 0.112 | Rejected — stably negative |
+| 5 | session_reversion_asia | 352 | 21.88% | 1.926 | -0.4449R | 0.539 | Rejected — stably negative |
+| 6 | session_reversion_london | 264 | 17.42% | 2.111 | -0.5447R | 0.445 | Rejected — stably negative (same config every fold) |
+| 7 | session_breakout_asia | 56 | 48.21% | 0.798 | -0.1401R | 0.743 | Rejected — not a fold majority |
+| 8 | session_breakout_london | 94 | 42.55% | 0.919 | -0.1914R | 0.680 | Rejected — not a fold majority |
+| 9 | orb_refine (wider grid) | 128 | 40.63% | 0.818 | -0.2493R | 0.560 | Rejected — worse than the frozen config |
+| 10 | prev_day_level | 72 (+9 holdout) | 68.06% | 1.218 | +0.5266R | 2.595 | Rejected — holdout too small (promising lead) |
+| 11 | fvg_continuation | 190 | 51.58% | 1.072 | +0.0695R | 1.142 | Rejected — unstable config (closest call) |
+| 12 | orb_failure_fade | 179 | 16.20% | 0.881 | -0.7372R | 0.170 | Rejected — stably negative |
+
+**0 of 12 accepted. 2,029 real OOS/holdout trades ledgered across this research** (verified directly
+against `data/pxbot_market_data.sqlite`: `SELECT COUNT(*) FROM trades WHERE run_id LIKE 'phase5_%'`
+— does not count toward the mission's 1,000-trade validation bar — see "Trade-count accounting" above; these are
+rejection evidence, not validation evidence). The frozen baseline (ORB inside it: +0.0482R/trade,
+n=301, PF 1.134) remains the only demonstrated real edge in this codebase, and remains unbeaten.
+
 ## Trade-frequency math for the 1,000-trade target
 
 At a practical operating cadence (~2 trades/day, ~250 trading days/year), 1,000 trades needs about
