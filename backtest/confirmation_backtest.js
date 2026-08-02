@@ -186,7 +186,20 @@ function stratifyByTier(results) {
   return byTier;
 }
 
-(async () => {
+async function loadBars(synthetic) {
+  if (synthetic) {
+    return generateSyntheticBars({ count: 12000, resolutionMin: 60, seed: 42, basePrice: 20000, volPts: 220 });
+  }
+  const health = await get('/api/health');
+  if (!health.authenticated) throw new Error('Not connected to TradeLocker — log in via the app UI first, then re-run this.');
+  const data = await get('/api/candles?resolution=60&count=19000');
+  if (!data.bars || !data.bars.length) throw new Error('No bars: ' + data.error);
+  return data.bars;
+}
+
+module.exports = { runConfirmationBacktest, stratifyByTier, loadBars };
+
+if (require.main === module) (async () => {
   let bars;
   if (SYNTHETIC) {
     console.log('*** --synthetic mode: seeded synthetic fixture, NOT real market data. ***');
@@ -244,6 +257,6 @@ function stratifyByTier(results) {
     : 'NOT monotonic across tiers on this dataset — the hypothesis is not cleanly supported here. Reported as-is, not adjusted to fit.');
 
   const outPath = path.join(__dirname, SYNTHETIC ? 'confirmation_backtest_synthetic_results.json' : 'confirmation_backtest_results.json');
-  fs.writeFileSync(outPath, JSON.stringify({ synthetic: SYNTHETIC, combined, folds: foldSummaries, tradeCount: results.length }, null, 2));
+  fs.writeFileSync(outPath, JSON.stringify({ synthetic: SYNTHETIC, combined, folds: foldSummaries, tradeCount: results.length, trades: results }, null, 2));
   console.log(`\nFull results written to ${outPath}`);
 })().catch(e => { console.error('Confirmation backtest failed:', e.message); process.exit(1); });

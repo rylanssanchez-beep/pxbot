@@ -15,4 +15,6 @@ backtest/signal_journal.json
 backtest/confirmation_backtest_results.json
 backtest/confirmation_backtest_synthetic_results.json
 backtest/montecarlo_results.json
+backtest/montecarlo_synthetic_results.json
 backtest/stress_test_results.json
+backtest/stress_test_synthetic_results.json
