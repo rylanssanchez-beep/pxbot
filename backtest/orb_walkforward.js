@@ -32,7 +32,10 @@ const DAY_FILTERS = {
 
 function buildGrid() {
   const grid = [];
-  for (const rangeHour of [7, 8, 9]) {
+  // Extended from [7,8,9] (premarket/NY-open only) to cover the rest of the
+  // NY session through early afternoon — "does a different NY-hour anchor
+  // beat the current 8am one" was never actually tested before.
+  for (const rangeHour of [7, 8, 9, 10, 11, 12, 13, 14]) {
     for (const targetMultiple of [0.5, 1, 1.5, 2, 3]) {
       for (const slBufferPct of [0.02, 0.05, 0.1]) {
         for (const minRangeSize of [0, 30, 60, 100]) {
