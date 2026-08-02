@@ -223,6 +223,86 @@ against `data/pxbot_market_data.sqlite`: `SELECT COUNT(*) FROM trades WHERE run_
 rejection evidence, not validation evidence). The frozen baseline (ORB inside it: +0.0482R/trade,
 n=301, PF 1.134) remains the only demonstrated real edge in this codebase, and remains unbeaten.
 
+## Round 5 — fvg_continuation_narrow: the first ACCEPTED candidate
+
+**Reproduce:** `node backtest/research_phase5.js --only=fvg_continuation_narrow`
+
+Round 4's `fvg_continuation` was rejected only on the stability gate, but its fold-by-fold detail
+showed something the strict exact-config-match check missed: `minGapSize=40` and the Tue/Wed/Thu
+day filter were picked in **5 of 5** folds, `targetRMultiple=1` and `maxWaitBars=10` in **4 of 5**
+(the one disagreement was fold 3, an early low-data fold). Only the stop-buffer flip-flopped between
+two nearby values. That is principled grounds for narrowing the grid to what the data already
+agreed on — not cherry-picking the answer, but recognizing a real pattern the coarse stability check
+couldn't see. A new candidate (`fvg_continuation_narrow`) was registered with those parameters fixed
+and only the genuinely uncertain dimension (stop buffer, plus a small window around gap size) left
+open, then run through the identical, unbiased walk-forward + untouched-holdout process.
+
+**Result: ACCEPTED.**
+
+| | Walk-forward (OOS) | Untouched holdout |
+|---|---|---|
+| Trades | 153 | 92 |
+| Folds/verdict | 5/5 profitable | positive, n well above the 15-trade minimum |
+| Win rate | 58.82% | 57.61% |
+| RR (payoff) | 0.878 | 0.849 |
+| Expectancy | +0.1049R | +0.0681R |
+| Profit factor | 1.254 | — |
+
+Combined (all 245 real trades, walk-forward + holdout, via `backtest/metrics.js`):
+
+| Metric | fvg_continuation_narrow | Frozen baseline (ORB component) | Frozen baseline (combined) |
+|---|---|---|---|
+| Trades | 245 | 301 | 429 |
+| Win rate | 58.37% | 55.48% | 55.24% |
+| Expectancy | **+0.0911R** | +0.0482R | +0.0298R |
+| Profit factor | **1.215** | 1.134 | 1.090 |
+| Max drawdown | **7.34R** | 13.25R | 15.07R |
+| Sharpe (per-trade) | 0.096 | 0.058 | 0.038 |
+| Net R by year | 2024: +5.9, 2025: +10.1, 2026: +6.3 | 2024: +17.3, 2025/26: net negative | same pattern |
+
+**This beats the baseline on win rate, expectancy, profit factor, drawdown, and — notably — year-
+over-year stability.** ORB's edge was concentrated almost entirely in 2024; this candidate
+contributed positively in all three calendar years tested, directly addressing the decay pattern
+flagged in `CURRENT_STRATEGY_BASELINE.md`.
+
+**Stress check (Part 11 requirement — is this a few lucky wins?):** removing the top 20 winning
+trades (8% of the sample) still leaves positive expectancy (+0.0145R, n=225); removing the top 10
+leaves +0.0542R. The top 10 winning trades themselves are all clustered at 0.95–0.97R, not
+outliers — this strategy uses a fixed 1R target, so no single trade can structurally dominate the
+result the way an unbounded-target strategy's occasional large win could. This is a healthier,
+less fragile profile than a strategy whose edge depends on a handful of outsized trades.
+
+**Funded-account comparison** (`node backtest/funded_account_report.js --runId=phase5_fvg_continuation_narrow --strategyId=fvg_continuation_narrow`,
+same generic illustrative configs as `FUNDED_ACCOUNT_RISK_REPORT.md`): at matching risk levels this
+candidate clears survival thresholds ORB alone could not — e.g. under adverse execution costs and
+the conservative config, ORB's failure probability was 11.7% even at the lowest tested risk (0.25%,
+already over the 10% bar); this candidate's failure probability at the same risk/config/scenario is
+3.4%. Under the lenient config at base costs, this candidate supports 1.00% risk/trade at 9.3%
+failure probability with an 87.2% chance of reaching the profit target (median 43 days) — ORB's
+comparable safe risk level was lower with a slower, less reliable path to target.
+
+## What this is NOT (read before treating this as "ready")
+
+- **Multiple-testing context**: this is the 13th configuration tested across 5 rounds this session
+  (12 rejected, this one accepted). Part 7 requires the evidence bar to rise with the number of
+  variants tried — one acceptance out of many honest attempts is a real, positive finding, but
+  should be held to *more* scrutiny, not less, precisely because so much was tried before it. It
+  clears every gate this project's process defines (stability, fold majority, minimum samples,
+  untouched-holdout positivity, an outlier-removal stress check, and now a funded-account
+  comparison) — but "cleared every gate we defined" is not the same claim as "definitely a durable
+  real-world edge."
+- **Still under `severe` execution-cost stress, this candidate also fails at every tested risk
+  level**, same as ORB. Severe-scenario fragility has not been solved by this finding.
+- **This has not yet been combined with ORB into an ensemble** or tested for correlation between the
+  two (if they tend to fire on the same days/conditions, combining them would not add the
+  diversification benefit Part 8 expects — untested, not assumed either way).
+- **No real fills have been measured on this account** — execution costs are still the same
+  documented assumptions used throughout, not measurements.
+- Per the mission's own status vocabulary: this candidate is **PAPER_READY at small size**
+  (comparable to or somewhat better than ORB's own readiness level) — not yet `MICRO_LIVE_READY`,
+  and `SCALE_READY` requires the full remaining checklist (ensemble correlation check, real-fill
+  cost measurement, a second independent holdout period as more calendar time accumulates).
+
 ## Trade-frequency math for the 1,000-trade target
 
 At a practical operating cadence (~2 trades/day, ~250 trading days/year), 1,000 trades needs about

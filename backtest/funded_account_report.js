@@ -13,7 +13,7 @@
 // mechanics; swap in your actual firm's real numbers via the CONFIGS object
 // before trusting this for a real evaluation.
 //
-// Usage: node backtest/funded_account_report.js
+// Usage: node backtest/funded_account_report.js [--runId=...] [--strategyId=...] [--outFile=...]
 
 const crypto = require('crypto');
 const fs = require('fs');
@@ -21,8 +21,12 @@ const path = require('path');
 const { MarketDataStore } = require('../data/store');
 const { runMonteCarlo } = require('../engine/funded_account_simulator');
 
-const RUN_ID = 'baseline_v1_base';
-const STRATEGY_ID = 'ORB';
+const argRunId = (process.argv.find(a => a.startsWith('--runId=')) || '').split('=')[1];
+const argStrategyId = (process.argv.find(a => a.startsWith('--strategyId=')) || '').split('=')[1];
+const argOutFile = (process.argv.find(a => a.startsWith('--outFile=')) || '').split('=')[1];
+const RUN_ID = argRunId || 'baseline_v1_base';
+const STRATEGY_ID = argStrategyId || 'ORB';
+const OUT_FILE = argOutFile || 'funded_account_report.json';
 const ITERATIONS = 10000;
 
 const CONFIGS = {
@@ -95,7 +99,7 @@ function datasetHash(trades) {
     }
   }
 
-  fs.writeFileSync(path.join(__dirname, 'funded_account_report.json'), JSON.stringify(report, null, 2));
-  console.log('\nFull report written to backtest/funded_account_report.json');
+  fs.writeFileSync(path.join(__dirname, OUT_FILE), JSON.stringify(report, null, 2));
+  console.log(`\nFull report written to backtest/${OUT_FILE}`);
   store.close();
 })().catch(e => { console.error('Funded-account report failed:', e.stack); process.exit(1); });

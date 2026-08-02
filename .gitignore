@@ -41,4 +41,4 @@ backtest/session_breakout_regime_results.json
 backtest/session_alt_strategies_results.json
 backtest/baseline_report_*.json
 backtest/phase5_results.json
-backtest/funded_account_report.json
+backtest/funded_account_report*.json

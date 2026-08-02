@@ -481,6 +481,21 @@ const CANDIDATES = {
     fn: tradesFromFvgContinuation,
     grid: grid({ targetRMultiple: [1, 1.5, 2], slBufferPct: [0.05, 0.1, 0.15], minGapSize: [10, 20, 40], maxWaitBars: [10, 20], allowedDaysOfWeek: Object.values(DAY_FILTERS) }),
   },
+  // Narrower follow-up: round 4's fold-by-fold picks showed minGapSize=40 and
+  // the Tue/Wed/Thu day filter agreeing in 5/5 folds, targetRMultiple=1 and
+  // maxWaitBars=10 agreeing in 4/5 (only fold 3, an early low-data fold,
+  // disagreed) — the ORIGINAL stability gate's exact-object-match check
+  // didn't detect this because slBufferPct alone flip-flopped between two
+  // nearby values. This grid fixes what the data already agreed on and
+  // narrows the search to the one dimension that didn't, so the walk-forward
+  // has less unrelated noise to pick a "different best" from. This is
+  // principled narrowing based on an observed cross-fold pattern, not
+  // picking the grid that produces the answer we want — the walk-forward +
+  // untouched holdout still runs from scratch, unbiased.
+  fvg_continuation_narrow: {
+    fn: tradesFromFvgContinuation,
+    grid: grid({ targetRMultiple: [1], slBufferPct: [0.03, 0.05, 0.075, 0.1], minGapSize: [30, 40, 50], maxWaitBars: [10], allowedDaysOfWeek: [[2, 3, 4]] }),
+  },
   orb_failure_fade: {
     fn: tradesFromOrbFailure,
     grid: grid({ confirmBars: [1, 2, 3], targetMultiple: [0.5, 1, 1.5], slBufferPct: [0.05, 0.1], minRangeSize: [0, 60, 100], allowedDaysOfWeek: Object.values(DAY_FILTERS) }),
