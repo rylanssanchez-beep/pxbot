@@ -765,6 +765,143 @@ function tradesFromRetestBreakout1m(bars, params) {
   return out;
 }
 
+// ── Prev-day high/low breakout with the operator's fixed geometry ─────────
+// Round 3's prev_day_level was the strongest level type tested (68% WR,
+// 5/5 folds) but used the full prior-day range as its stop (way over the
+// 30pt cap). This re-geometries it: fixed ≤30pt stop, fixed 40/60/100pt
+// targets, entries only in the operator's window (premarket + NY AM,
+// 07:00-12:00 CT), on 1m bars. Two entry styles in the grid: 'break'
+// (enter on the close-confirmed breakout bar) and 'retest' (wait for the
+// pullback to the level after confirmation).
+function tradesFromPrevDayFixedStop1m(bars, params) {
+  const th = { entryStyle: 'break', stopPoints: 25, targetPoints: 60, maxWaitBars: 60, allowedDaysOfWeek: [1, 2, 3, 4, 5], ...params };
+  if (th.stopPoints > MAX_STOP_POINTS) return [];
+  const byDate = new Map();
+  for (const b of bars) {
+    const { hour, dateKey, dow } = ctParts(b.time);
+    if (!byDate.has(dateKey)) byDate.set(dateKey, { all: [], exec: [], dow });
+    const day = byDate.get(dateKey);
+    day.all.push(b);
+    if (hour >= 7 && hour < 19) day.exec.push(b); // execution room through the evening; entries gated separately below
+  }
+  const dateKeys = [...byDate.keys()].sort();
+  const out = [];
+  for (let i = 1; i < dateKeys.length; i++) {
+    const today = byDate.get(dateKeys[i]);
+    const yesterday = byDate.get(dateKeys[i - 1]);
+    if (!today.exec.length || yesterday.all.length < 300) continue; // need a real full prior day, not a holiday stub
+    if (!th.allowedDaysOfWeek.includes(today.dow)) continue;
+    const prevHigh = Math.max(...yesterday.all.map(b => b.high));
+    const prevLow = Math.min(...yesterday.all.map(b => b.low));
+    if (!(prevHigh > prevLow)) continue;
+
+    // 1) Close-confirmed break of either level, inside 07:00-12:00 CT only.
+    let breakIdx = -1, bias = null, level = null;
+    for (let k = 0; k < today.exec.length; k++) {
+      const b = today.exec[k];
+      if (ctParts(b.time).hour >= 12) break;
+      if (b.close > prevHigh) { bias = 'LONG'; level = prevHigh; breakIdx = k; break; }
+      if (b.close < prevLow) { bias = 'SHORT'; level = prevLow; breakIdx = k; break; }
+    }
+    if (breakIdx === -1) continue;
+
+    let entryIdx = -1, entryPriceRaw = null;
+    if (th.entryStyle === 'break') {
+      entryIdx = breakIdx;
+      entryPriceRaw = today.exec[breakIdx].close; // enter on the confirming bar's close
+    } else { // retest
+      for (let k = breakIdx + 1; k < Math.min(today.exec.length, breakIdx + 1 + th.maxWaitBars); k++) {
+        const b = today.exec[k];
+        const touched = bias === 'LONG' ? b.low <= level : b.high >= level;
+        if (touched) { entryIdx = k; entryPriceRaw = level; break; }
+      }
+      if (entryIdx === -1) continue;
+    }
+
+    const sl = bias === 'LONG' ? entryPriceRaw - th.stopPoints : entryPriceRaw + th.stopPoints;
+    const target = bias === 'LONG' ? entryPriceRaw + th.targetPoints : entryPriceRaw - th.targetPoints;
+    const execBars = today.exec.slice(entryIdx);
+    const r = simulateTrade({
+      bars: execBars, signalIndex: -1, direction: bias, orderType: 'preComputedFill',
+      precomputedEntryIndex: 0, precomputedEntryPriceRaw: entryPriceRaw,
+      stopPrice: sl, targetPrice: target,
+      exitPlan: { maxHoldingBars: execBars.length, sessionCloseAfterHour: 15 },
+      costModel: COST_MODEL, ctPartsFn: ctParts,
+    });
+    if (r.filled) out.push(r);
+  }
+  return out;
+}
+
+// ── The VALIDATED hourly FVG edge with a 1-minute precision entry ─────────
+// fvg_continuation_narrow (accepted: 58% WR, 1R targets, 5/5 folds + 92-
+// trade holdout) has one incompatibility with the operator's constraints:
+// its stop (~1.2x a 40-50pt gap) is 48-60pts. This candidate keeps the
+// SAME signal — hourly 3-bar imbalance, >=40pt gap, Tue/Wed/Thu — but
+// executes on 1m bars: wait for price to penetrate `entryDepth` of the way
+// into the gap (a deeper, better price than the hourly version's first-
+// touch), stop = fixed <=30pts from entry, target = targetRMultiple x
+// stopPoints (37-90pts — hourly-scale targets, capped risk). Hourly bars
+// are aggregated deterministically from the same 1m array; a gap is only
+// actionable after its third hourly bar has CLOSED (no lookahead).
+const { aggregateOHLC } = require('../engine/replay_engine');
+function tradesFromFvgHourly1mEntry(bars, params) {
+  const th = { minGapSize: 40, entryDepth: 0.4, stopPoints: 25, targetRMultiple: 2, maxWaitMinutes: 600, maxHoldMinutes: 360, allowedDaysOfWeek: [2, 3, 4], ...params };
+  if (th.stopPoints > MAX_STOP_POINTS) return [];
+  const hourly = aggregateOHLC(bars, 3600);
+  const timeToIdx = new Map();
+  for (let k = 0; k < bars.length; k++) timeToIdx.set(bars[k].time, k);
+  const out = [];
+  let lastExitTime = 0; // chronological non-overlap across signals
+
+  for (let i = 2; i < hourly.length; i++) {
+    if (hourly[i].time - hourly[i - 2].time !== 7200) continue; // non-contiguous hours (weekend/halt) — not an imbalance
+    const left = hourly[i - 2], right = hourly[i];
+    let bias = null, gapLow = null, gapHigh = null;
+    if (left.high < right.low && (right.low - left.high) >= th.minGapSize) { bias = 'LONG'; gapLow = left.high; gapHigh = right.low; }
+    else if (left.low > right.high && (left.low - right.high) >= th.minGapSize) { bias = 'SHORT'; gapLow = right.high; gapHigh = left.low; }
+    if (!bias) continue;
+    const signalTime = right.time + 3600; // the imbalance exists only once the third hourly bar CLOSES
+    if (!th.allowedDaysOfWeek.includes(ctParts(right.time).dow)) continue;
+    if (signalTime < lastExitTime) continue;
+
+    const gapSize = gapHigh - gapLow;
+    // Deeper-entry level inside the gap: LONG enters as price falls into the
+    // gap from above; SHORT enters as price rises into it from below.
+    const entryLevel = bias === 'LONG' ? gapHigh - gapSize * th.entryDepth : gapLow + gapSize * th.entryDepth;
+
+    // Find the first 1m bar at/after signalTime; scan up to maxWaitMinutes for a touch.
+    let startIdx = timeToIdx.get(signalTime);
+    if (startIdx === undefined) {
+      // signalTime lands in a data gap — take the next existing bar (binary scan forward one hour max)
+      for (let t = signalTime; t < signalTime + 3600 && startIdx === undefined; t += 60) startIdx = timeToIdx.get(t);
+      if (startIdx === undefined) continue;
+    }
+    let entryIdx = -1;
+    for (let k = startIdx; k < Math.min(bars.length, startIdx + th.maxWaitMinutes); k++) {
+      const b = bars[k];
+      const touched = bias === 'LONG' ? b.low <= entryLevel : b.high >= entryLevel;
+      if (touched) { entryIdx = k; break; }
+    }
+    if (entryIdx === -1) continue;
+
+    const sl = bias === 'LONG' ? entryLevel - th.stopPoints : entryLevel + th.stopPoints;
+    const target = bias === 'LONG' ? entryLevel + th.stopPoints * th.targetRMultiple : entryLevel - th.stopPoints * th.targetRMultiple;
+    const execBars = bars.slice(entryIdx, entryIdx + th.maxHoldMinutes + 10);
+    const r = simulateTrade({
+      bars: execBars, signalIndex: -1, direction: bias, orderType: 'preComputedFill',
+      precomputedEntryIndex: 0, precomputedEntryPriceRaw: entryLevel,
+      stopPrice: sl, targetPrice: target,
+      exitPlan: { maxHoldingBars: th.maxHoldMinutes }, costModel: COST_MODEL,
+    });
+    if (r.filled) {
+      out.push(r);
+      lastExitTime = r.exitTime || (bars[entryIdx].time + th.maxHoldMinutes * 60);
+    }
+  }
+  return out;
+}
+
 // ── Candidate registry: family label -> { tradeFn, grid } ─────────────────
 const DAY_FILTERS = {
   allDays: [0, 1, 2, 3, 4, 5, 6], skipMonday: [0, 2, 3, 4, 5, 6], tueThuOnly: [2, 3, 4],
@@ -886,6 +1023,15 @@ const CANDIDATES = {
   retest_asia_1m: {
     fn: tradesFromRetestBreakout1m, data: '1m',
     grid: grid({ session: ['asia'], rangeMinutes: [60, 90], stopPoints: [20, 25, 30], targetRMultiple: [1.5, 2], maxWaitBars: [60], allowedDaysOfWeek: [[0, 1, 2, 3, 4, 5, 6], [0, 2, 3, 4, 5, 6]] }),
+  },
+  // ── Bigger targets + higher win rate under the 30pt cap (round 7) ──────
+  prevday_fixedstop_1m: {
+    fn: tradesFromPrevDayFixedStop1m, selectBy: 'winRate', data: '1m',
+    grid: grid({ entryStyle: ['break', 'retest'], stopPoints: [25, 30], targetPoints: [40, 60, 100], allowedDaysOfWeek: [[1, 2, 3, 4, 5], [2, 3, 4]] }),
+  },
+  fvg_hourly_1m_entry: {
+    fn: tradesFromFvgHourly1mEntry, selectBy: 'winRate', data: '1m',
+    grid: grid({ minGapSize: [40, 50], entryDepth: [0.3, 0.5], stopPoints: [25, 30], targetRMultiple: [1.5, 2, 3], maxWaitMinutes: [600], maxHoldMinutes: [360], allowedDaysOfWeek: [[2, 3, 4]] }),
   },
 };
 
