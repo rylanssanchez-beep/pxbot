@@ -37,7 +37,15 @@ const orbEngine = require('./orb_engine');
 const sessionBreakout = require('./session_breakout_engine');
 
 const SYMBOL = 'NAS100';
-const COST_MODEL = { spreadPts: 2, slippagePts: 1, commissionR: 0.01 }; // same 'base' assumptions as the baseline
+// Default spread is the conservative 2pt assumption; --spread=N overrides
+// it (e.g. --spread=1.32, the MEASURED median from this account's real feed
+// — scripts/measure_spread.js, data/logs/measured_spread.json). Slippage
+// stays an assumption either way: no real fills exist yet to measure it.
+const COST_MODEL = { spreadPts: 2, slippagePts: 1, commissionR: 0.01 };
+{
+  const spreadArg = (process.argv.find(a => a.startsWith('--spread=')) || '').split('=')[1];
+  if (spreadArg) { COST_MODEL.spreadPts = parseFloat(spreadArg); console.log(`Cost model: using spreadPts=${COST_MODEL.spreadPts} (CLI override — measured, not assumed)`); }
+}
 const NUM_FOLDS = 6;
 const MIN_TRAIN_TRADES = 12;
 const HOLDOUT_FRACTION = 0.20;
@@ -675,6 +683,88 @@ function tradesFromAsiaFade1m(bars, params) {
   return out;
 }
 
+// ── Breakout-RETEST continuation on 1m — the operator's stated geometry:
+// fixed stop ≤30pts, target 30-100+pts (1.5-3R). Instead of entering the
+// breakout itself with the range as the stop (which the 30pt cap forbids —
+// see micro_orb_1m's zero qualifying days), this waits for the breakout to
+// be CONFIRMED by a close beyond the level, then enters on the pullback
+// RETEST of that level, with a fixed-point stop just beyond it. Tight stop
+// because the entry is at the level, not chasing; multi-R target because
+// the bet is continuation of an already-confirmed break. Covers both
+// operator sessions via the `session` param: 'nyopen' (08:30 CT range,
+// NY-AM-only entries, session-close exit) and 'asia' (19:00 CT range,
+// Asia-end exit).
+function tradesFromRetestBreakout1m(bars, params) {
+  const th = { session: 'nyopen', rangeMinutes: 15, stopPoints: 25, targetRMultiple: 2, breakoutSearchBars: 120, maxWaitBars: 45, allowedDaysOfWeek: [1, 2, 3, 4, 5], ...params };
+  if (th.stopPoints > MAX_STOP_POINTS) return [];
+  const byDay = new Map();
+  for (const b of bars) {
+    const { hour } = ctParts(b.time);
+    if (th.session === 'nyopen') {
+      const { dateKey, dow } = ctParts(b.time);
+      if (!byDay.has(dateKey)) byDay.set(dateKey, { range: [], forward: [], tail: [], dow });
+      const day = byDay.get(dateKey);
+      const rangeEnd = 8.5 + th.rangeMinutes / 60;
+      if (hour >= 8.5 && hour < rangeEnd) day.range.push(b);
+      else if (hour >= rangeEnd && hour < 19) day.forward.push(b);
+    } else { // asia — trading-day bucketing via +6h shift (matches ict_engine's rollover)
+      const shiftedKey = ctParts(b.time + 6 * 3600).dateKey;
+      if (!byDay.has(shiftedKey)) byDay.set(shiftedKey, { range: [], forward: [], tail: [], dow: null });
+      const day = byDay.get(shiftedKey);
+      if (hour >= 19 || hour < 1) {
+        if (day.range.length < th.rangeMinutes) day.range.push(b);
+        else day.forward.push(b);
+      } else if (hour >= 1 && hour < 7) day.tail.push(b); // London — execution room past Asia's end
+    }
+  }
+  const out = [];
+  for (const [dateKey, day] of byDay.entries()) {
+    if (day.range.length < th.rangeMinutes * 0.6 || !day.forward.length) continue;
+    const dow = th.session === 'nyopen' ? day.dow : ctParts(day.range[day.range.length - 1].time + 6 * 3600).dow;
+    if (!th.allowedDaysOfWeek.includes(dow)) continue;
+    const hi = Math.max(...day.range.map(b => b.high));
+    const lo = Math.min(...day.range.map(b => b.low));
+    if (!(hi > lo)) continue;
+
+    // 1) Breakout confirmation: first CLOSE beyond the range (wick-throughs don't count).
+    let breakoutIdx = -1, bias = null, level = null;
+    const searchEnd = Math.min(day.forward.length, th.breakoutSearchBars);
+    for (let k = 0; k < searchEnd; k++) {
+      const b = day.forward[k];
+      if (th.session === 'nyopen' && ctParts(b.time).hour >= 12) break; // NY AM only
+      if (b.close > hi) { bias = 'LONG'; level = hi; breakoutIdx = k; break; }
+      if (b.close < lo) { bias = 'SHORT'; level = lo; breakoutIdx = k; break; }
+    }
+    if (breakoutIdx === -1) continue;
+
+    // 2) Pullback retest of the broken level within maxWaitBars.
+    let entryIdx = -1;
+    for (let k = breakoutIdx + 1; k < Math.min(day.forward.length, breakoutIdx + 1 + th.maxWaitBars); k++) {
+      const b = day.forward[k];
+      const touched = bias === 'LONG' ? b.low <= level : b.high >= level;
+      if (touched) { entryIdx = k; break; }
+    }
+    if (entryIdx === -1) continue; // broke out but never pulled back — no chase, no trade
+
+    const sl = bias === 'LONG' ? level - th.stopPoints : level + th.stopPoints;
+    const target = bias === 'LONG' ? level + th.stopPoints * th.targetRMultiple : level - th.stopPoints * th.targetRMultiple;
+
+    const execBars = th.session === 'nyopen'
+      ? day.forward.slice(entryIdx)
+      : [...day.forward.slice(entryIdx), ...day.tail];
+    const exitPlan = th.session === 'nyopen'
+      ? { maxHoldingBars: execBars.length, sessionCloseAfterHour: 15 }
+      : { maxHoldingBars: Math.max(1, day.forward.length - entryIdx - 1) }; // TIME exit at Asia end; London bars exist beyond
+    const r = simulateTrade({
+      bars: execBars, signalIndex: -1, direction: bias, orderType: 'preComputedFill',
+      precomputedEntryIndex: 0, precomputedEntryPriceRaw: level,
+      stopPrice: sl, targetPrice: target, exitPlan, costModel: COST_MODEL, ctPartsFn: ctParts,
+    });
+    if (r.filled) out.push(r);
+  }
+  return out;
+}
+
 // ── Candidate registry: family label -> { tradeFn, grid } ─────────────────
 const DAY_FILTERS = {
   allDays: [0, 1, 2, 3, 4, 5, 6], skipMonday: [0, 2, 3, 4, 5, 6], tueThuOnly: [2, 3, 4],
@@ -787,6 +877,15 @@ const CANDIDATES = {
   asia_fade_1m_capped: {
     fn: tradesFromAsiaFade1m, selectBy: 'winRate', data: '1m',
     grid: grid({ rangeMinutes: [60], stopPoints: [20, 30], targetPoints: [8, 12, 18], minRangeSize: [20, 40], allowedDaysOfWeek: [[0, 1, 2, 3, 4, 5, 6], [0, 2, 3, 4, 5, 6]] }),
+  },
+  // ── Operator's stated geometry: ≤30pt stop, 30-100+pt (1.5-3R) targets ──
+  retest_nyopen_1m: {
+    fn: tradesFromRetestBreakout1m, data: '1m',
+    grid: grid({ session: ['nyopen'], rangeMinutes: [15, 30], stopPoints: [20, 25, 30], targetRMultiple: [1.5, 2, 3], maxWaitBars: [45], allowedDaysOfWeek: [[1, 2, 3, 4, 5], [2, 3, 4]] }),
+  },
+  retest_asia_1m: {
+    fn: tradesFromRetestBreakout1m, data: '1m',
+    grid: grid({ session: ['asia'], rangeMinutes: [60, 90], stopPoints: [20, 25, 30], targetRMultiple: [1.5, 2], maxWaitBars: [60], allowedDaysOfWeek: [[0, 1, 2, 3, 4, 5, 6], [0, 2, 3, 4, 5, 6]] }),
   },
 };
 
