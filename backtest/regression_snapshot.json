@@ -1,0 +1,76 @@
+{
+  "fixture": {
+    "count": 8000,
+    "seed": 42,
+    "firstTime": 1706893200,
+    "lastTime": 1735689600
+  },
+  "ict": {
+    "totalDays": 333,
+    "tradedDays": 59,
+    "wins": 38,
+    "losses": 21,
+    "timeouts": 0,
+    "totalR": 10.36,
+    "byScenario": {
+      "S0": {
+        "days": 213,
+        "traded": 0,
+        "wins": 0,
+        "losses": 0,
+        "timeouts": 0,
+        "totalR": 0,
+        "winRate": null,
+        "avgR": null
+      },
+      "S2": {
+        "days": 44,
+        "traded": 32,
+        "wins": 24,
+        "losses": 8,
+        "timeouts": 0,
+        "totalR": 12.519999999999998,
+        "winRate": 75,
+        "avgR": 0.39
+      },
+      "S1": {
+        "days": 34,
+        "traded": 27,
+        "wins": 14,
+        "losses": 13,
+        "timeouts": 0,
+        "totalR": -2.16,
+        "winRate": 51.9,
+        "avgR": -0.08
+      },
+      "S4": {
+        "days": 41,
+        "traded": 0,
+        "wins": 0,
+        "losses": 0,
+        "timeouts": 0,
+        "totalR": 0,
+        "winRate": null,
+        "avgR": null
+      },
+      "S3": {
+        "days": 1,
+        "traded": 0,
+        "wins": 0,
+        "losses": 0,
+        "timeouts": 0,
+        "totalR": 0,
+        "winRate": null,
+        "avgR": null
+      }
+    }
+  },
+  "orb": {
+    "totalDays": 230,
+    "tradedDays": 230,
+    "wins": 142,
+    "losses": 65,
+    "totalR": 2.62,
+    "avgR": 0.011
+  }
+}

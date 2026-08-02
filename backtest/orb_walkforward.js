@@ -16,13 +16,32 @@ function get(p) {
   });
 }
 
+// Same day-of-week filter convention ict_engine.js's walkforward.js already
+// uses. ORB never had this lever before (orb_engine.js:DEFAULT_ORB) —
+// real evidence (146 real 1-minute-execution trades,
+// backtest/confirmation_backtest_finegrain.js) showed Monday avgR -0.275
+// (n=25, 28% win) dragging combined performance versus Tue/Thu +0.091/+0.042
+// (60%+ win) — this grid dimension exists to let that evidence actually be
+// tested out-of-sample, not to assume the answer.
+const DAY_FILTERS = {
+  allDays:    [0, 1, 2, 3, 4, 5, 6],
+  skipMonday: [0, 2, 3, 4, 5, 6],
+  skipMonFri: [0, 2, 3, 4, 5],
+  tueThuOnly: [2, 3, 4],
+};
+
 function buildGrid() {
   const grid = [];
-  for (const rangeHour of [7, 8, 9]) {
+  // Extended from [7,8,9] (premarket/NY-open only) to cover the rest of the
+  // NY session through early afternoon — "does a different NY-hour anchor
+  // beat the current 8am one" was never actually tested before.
+  for (const rangeHour of [7, 8, 9, 10, 11, 12, 13, 14]) {
     for (const targetMultiple of [0.5, 1, 1.5, 2, 3]) {
       for (const slBufferPct of [0.02, 0.05, 0.1]) {
         for (const minRangeSize of [0, 30, 60, 100]) {
-          grid.push({ rangeHour, targetMultiple, slBufferPct, minRangeSize, maxHoldHours: 8 });
+          for (const [dayFilterName, allowedDaysOfWeek] of Object.entries(DAY_FILTERS)) {
+            grid.push({ rangeHour, targetMultiple, slBufferPct, minRangeSize, maxHoldHours: 8, allowedDaysOfWeek, dayFilterName });
+          }
         }
       }
     }

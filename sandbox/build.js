@@ -8,6 +8,7 @@
 const fs   = require('fs');
 const path = require('path');
 const http = require('http');
+const structureEngine = require('../engine/structure_engine');
 
 function get(p) {
   return new Promise((resolve, reject) => {
@@ -23,51 +24,32 @@ function fmtDate(t) {
   return new Date(t * 1000).toLocaleDateString('en-US', { timeZone: 'America/Chicago' });
 }
 
+// Delegates to engine/structure_engine.js (consolidated — this used to be a
+// third independent copy of the same swing/EQ/ATR/weekly-profile logic also
+// duplicated in server.js and app.js). Output shape/rounding preserved exactly.
 function findSwings(daily) {
-  const swings = [];
-  for (let i = 2; i < daily.length - 2; i++) {
-    const b = daily[i];
-    if (b.high > daily[i-1].high && b.high > daily[i-2].high && b.high > daily[i+1].high && b.high > daily[i+2].high)
-      swings.push({ type: 'SH', price: +b.high.toFixed(2), date: fmtDate(b.time) });
-    if (b.low < daily[i-1].low && b.low < daily[i-2].low && b.low < daily[i+1].low && b.low < daily[i+2].low)
-      swings.push({ type: 'SL', price: +b.low.toFixed(2), date: fmtDate(b.time) });
-  }
-  return swings;
+  return structureEngine.findSwingPoints(daily, 2).map(s => ({
+    type: s.type, price: +s.price.toFixed(2), date: fmtDate(s.bar.time),
+  }));
 }
 
 function findEqLevels(daily) {
-  const eq = [];
   const recent = daily.slice(-60);
-  for (let i = 0; i < recent.length - 1; i++) {
-    for (let j = i + 1; j < Math.min(i + 10, recent.length); j++) {
-      if (Math.abs(recent[i].high - recent[j].high) < 10)
-        eq.push({ type: 'EQH', price: +((recent[i].high + recent[j].high) / 2).toFixed(2), dates: [fmtDate(recent[i].time), fmtDate(recent[j].time)] });
-      if (Math.abs(recent[i].low - recent[j].low) < 10)
-        eq.push({ type: 'EQL', price: +((recent[i].low + recent[j].low) / 2).toFixed(2), dates: [fmtDate(recent[i].time), fmtDate(recent[j].time)] });
-    }
-  }
-  return eq;
+  return structureEngine.findEqualLevels(recent, 10, 10).map(e => ({
+    type: e.type, price: +e.price.toFixed(2), dates: [fmtDate(e.barI.time), fmtDate(e.barJ.time)],
+  }));
 }
 
 function atr14(daily) {
-  const tail = daily.slice(-15);
-  const trs = tail.map((b, i) => i === 0 ? b.high - b.low : Math.max(b.high - b.low, Math.abs(b.high - tail[i-1].close), Math.abs(b.low - tail[i-1].close)));
-  return +(trs.slice(-14).reduce((a, b) => a + b, 0) / 14).toFixed(1);
+  return +structureEngine.atr(daily, 14).toFixed(1);
 }
 
 function weeklyProfile(daily) {
-  const weeks = [];
-  for (let i = 0; i < daily.length; i += 5) {
-    const chunk = daily.slice(i, i + 5);
-    if (!chunk.length) continue;
-    const hi = Math.max(...chunk.map(b => b.high)), lo = Math.min(...chunk.map(b => b.low));
-    weeks.push({
-      weekStart: fmtDate(chunk[0].time), open: chunk[0].open, close: chunk[chunk.length-1].close,
-      high: +hi.toFixed(2), low: +lo.toFixed(2), range: +(hi - lo).toFixed(1),
-      bias: chunk[chunk.length-1].close > chunk[0].open ? 'BULL' : 'BEAR',
-    });
-  }
-  return weeks;
+  return structureEngine.weeklyProfile(daily, 5).map(w => ({
+    weekStart: fmtDate(w.weekStartTime), open: w.open, close: w.close,
+    high: +w.high.toFixed(2), low: +w.low.toFixed(2), range: +w.range.toFixed(1),
+    bias: w.bias,
+  }));
 }
 
 (async () => {

@@ -14,6 +14,8 @@ const { execFile } = require('child_process');
 const ROOT = __dirname;
 const PORT = 8899;
 
+const structureEngine = require('./engine/structure_engine');
+
 // ── curl-based HTTP helper (bypasses Cloudflare TLS fingerprinting) ───────────
 // Windows 10+ ships curl.exe built-in. curl uses Schannel (WinTLS) which
 // Cloudflare treats as a legitimate client, unlike Node.js's OpenSSL fingerprint.
@@ -544,16 +546,218 @@ function handleHealth(req, res) {
 // can never present this as more certain than the real backtest evidence.
 const ictEngine = require('./backtest/ict_engine');
 const orbEngine = require('./backtest/orb_engine');
+const sessionBreakoutEngine = require('./backtest/session_breakout_engine');
 
 const SIGNAL_ICT_MIN_LEG  = 199;
-const SIGNAL_ORB_CONFIG   = { ...orbEngine.DEFAULT_ORB, rangeHour: 9, targetMultiple: 0.5, slBufferPct: 0.05, minRangeSize: 100 };
-const ICT_TRACK_RECORD = 'leg>=199pt filter: +0.349R avg train (n=18), +0.405R avg OOS (n=7) — thin sample, not proven.';
-const ORB_TRACK_RECORD = 'rangeHour=9/target=0.5x, folds 1+2 only (both profitable): +0.110R/trade combined (n=137). '
-  + 'Fold 4 picked this same shape and went slightly negative (-0.025R, n=80) — excluded here by request, not silently.';
+// rangeHour=8/target=1x/slBuffer=0.1/skipMonday — re-validated via walk-forward
+// (backtest/orb_walkforward.js) after real 1m-execution data showed the OLD
+// rangeHour=9/target=0.5x config had a payoff-asymmetry problem (target
+// smaller than stop, needing an unrealistic win rate to break even) and that
+// Monday specifically dragged combined performance (avgR -0.275, n=25, 28%
+// win vs Tue/Thu's 60%+). This exact config was picked independently in
+// EVERY walk-forward fold (5/5) — a stable signal, not noise.
+const SIGNAL_ORB_CONFIG   = { ...orbEngine.DEFAULT_ORB, rangeHour: 8, targetMultiple: 1, slBufferPct: 0.1, minRangeSize: 100, allowedDaysOfWeek: [0, 2, 3, 4, 5, 6] };
+const ICT_TRACK_RECORD = 'leg>=199pt filter, MANAGED exit (breakeven ladder — see reasoning): real 1-minute-execution '
+  + 'out-of-sample TRAIN avgR 0.314 (n=11), TEST avgR 0.405 (n=7, held out, most recent period, stronger than train). '
+  + 'Caveat: the same logic checked against the much larger 2.3-year hourly-approximated history was far weaker '
+  + '(avgR -0.068 -> -0.053, still negative) — hourly bars can\'t resolve the exact order TP1/stop are hit within an '
+  + 'hour, so that check is less accurate for this specific staged-exit logic, but it is a vastly bigger sample. Both results are real; neither is hidden.';
+const ORB_TRACK_RECORD = 'rangeHour=8/target=1x/slBuffer=0.1/skipMonday: walk-forward 4/5 folds profitable (vs 2/5 for '
+  + 'the prior rangeHour=9/target=0.5x config), combined OOS +16.81R over 299 trades (avg +0.056R/trade), and this '
+  + 'exact config was picked independently in every fold. Caveat: within the most recent fold, performance decayed '
+  + 'over time and the last ~6-7 weeks tested currently do WORSE than the prior live config (-0.11R vs -0.029R avg) — '
+  + 'a real recent-period risk, not hidden.';
+
+// NY-premarket (07:00-09:30 CT) range breakout — new third strategy, the
+// most rigorously validated of the three: 5/5 walk-forward folds profitable
+// on the full 2.3yr hourly-approximated history, CONFIRMED at real
+// 1-minute-execution granularity over the ~207-day window where that data
+// exists (avgR 0.108-0.115 vs the hourly walk-forward's 0.122 — the more
+// precise test agrees with the coarser one, unlike ICT/ORB where they
+// diverged), Monte Carlo shows controlled drawdown (median 3-6% depending on
+// risk sizing, P(net loss) ~3%), and the edge survives up to 20pt of added
+// slippage against a ~281pt median risk. Real, plausible mechanism: 07:00-
+// 09:30 CT is when most major US economic data releases land (CPI, NFP,
+// etc.) — a real reason a premarket range could set up genuine directional
+// continuation, not just a numerical coincidence.
+//
+// Real caveats, not hidden: (1) that same news-release timing means REAL
+// slippage/spread risk around this window that historical OHLC bars can't
+// fully capture — the stress test above is a generic slippage model, not a
+// news-specific one. (2) Tue/Wed/Thu only (walk-forward's own selectivity
+// finding) means ~2 opportunities/week. (3) Hold-time (maxHoldBars) was
+// fixed, never tuned as part of the grid search — a real untested
+// dimension. (4) One instrument, one ~207-day precise-execution window —
+// strong relative to everything else tested this session, still not
+// "proven for any account size" the way years of live results would be.
+const SIGNAL_PREMARKET_CONFIG = { targetMultiple: 0.5, slBufferPct: 0.05, minRangeSize: 100, allowedDaysOfWeek: [2, 3, 4] };
+const PREMARKET_TRACK_RECORD = 'NY premarket (07:00-09:30 CT) range breakout, Tue/Wed/Thu only: walk-forward 5/5 folds '
+  + 'profitable on 2.3yr hourly-approximated history (avg +0.122R/trade, n=258), CONFIRMED at real 1-minute execution '
+  + 'over ~207 real days (avg +0.108-0.115R/trade, n=83) — the precise test agrees with the coarse one. Monte Carlo: '
+  + 'median drawdown 3-6% depending on risk size, P(net loss) ~3%. Edge survives up to 20pt slippage vs ~281pt median '
+  + 'risk. Caveats: this window is exactly when major US economic data drops, a real slippage/spread risk a generic '
+  + 'stress model doesn\'t fully capture; hold-time was never tuned; one instrument, ~207 real-precision days — the '
+  + 'strongest evidence found this session, not a guarantee.';
+
+// ── Confirmation Engine — ADDITIVE ONLY ────────────────────────────────────
+// Fractal/MTF/regime/confluence context (engine/*.js) attached alongside
+// ict/orb, never altering them. Explicitly NOT gating any trade yet: a live
+// walk-forward check on this account's real history (Aug 2026) found ICT's
+// leg>=199pt filter is currently NOT showing a validated edge (-0.068R avg,
+// 1/5 walk-forward folds profitable — the documented +0.405R OOS above was a
+// thin n=7 sample that hasn't held up), and ORB's edge, while real, is
+// thinner than originally documented (+0.068R avg live vs the +0.110R this
+// config was tuned on). The confirmation tiers DID track real expectancy
+// monotonically on that same live run (skip 0.004R -> B 0.066R -> A 0.111R
+// -> A+ 0.144R) but per-fold sample sizes (as low as n=8) are still too thin
+// to trust as a live gate. So: surfaced for visibility now, gating is a
+// later, separate decision once more live confirmation-vs-outcome data
+// accumulates (see backtest/journal_review.js's planned factor-correlation
+// analysis).
+const fractalEngine = require('./engine/fractal_engine');
+const mtfEngine = require('./engine/mtf_engine');
+const confirmationEngine = require('./engine/confirmation_engine');
+
+function loadConfirmationWeights() {
+  try {
+    const raw = fs.readFileSync(path.join(ROOT, 'engine', 'confirmation_weights.json'), 'utf8');
+    const parsed = JSON.parse(raw);
+    return parsed.weights || confirmationEngine.DEFAULT_WEIGHTS;
+  } catch (_) {
+    return confirmationEngine.DEFAULT_WEIGHTS;
+  }
+}
+
+// Same hourly->daily/4H aggregation approach validated in
+// backtest/confirmation_backtest.js — kept here rather than shared since one
+// is a live-request helper and the other an offline-backtest helper with
+// different bar-count/perf tradeoffs, but the algorithm is identical.
+function hourlyToDaily(bars) {
+  const byDate = new Map();
+  for (const b of bars) {
+    const key = signalCtParts(b.time).dateKey;
+    if (!byDate.has(key)) byDate.set(key, []);
+    byDate.get(key).push(b);
+  }
+  const out = [];
+  for (const chunk of byDate.values()) {
+    out.push({ time: chunk[0].time, open: chunk[0].open, close: chunk[chunk.length - 1].close,
+      high: Math.max(...chunk.map(b => b.high)), low: Math.min(...chunk.map(b => b.low)),
+      volume: chunk.reduce((a, b) => a + (b.volume || 0), 0) });
+  }
+  out.sort((a, b) => a.time - b.time);
+  return out;
+}
+function hourlyToH4(bars) {
+  const out = [];
+  for (let i = 0; i < bars.length; i += 4) {
+    const chunk = bars.slice(i, i + 4);
+    if (!chunk.length) continue;
+    out.push({ time: chunk[0].time, open: chunk[0].open, close: chunk[chunk.length - 1].close,
+      high: Math.max(...chunk.map(b => b.high)), low: Math.min(...chunk.map(b => b.low)),
+      volume: chunk.reduce((a, b) => a + (b.volume || 0), 0) });
+  }
+  return out;
+}
+
+// The m1/m5/m15/h4/d1 fetches (+ weekly/monthly aggregation) cost ~2-3s —
+// mostly loopback HTTP + JSON serialization of the 1-minute series, which is
+// by far the largest (13k+ bars). Repeated /api/signal checks within a short
+// window (manual re-clicks, or auto-poll cadence) don't need fully fresh
+// MTF/execution context every single time — 1-minute bars are only that
+// fresh anyway. Cache by wall-clock age, not by bar-time-equality, so it
+// still refreshes on a predictable cadence regardless of exactly when new
+// bars land. h1 is NOT cached here since handleSignal already has it for
+// free from its own existing hourly fetch.
+let _mtfCache = null; // { data: {m1,m5,m15,h4,d1,weekly,monthly}, computedAt }
+const MTF_CACHE_MAX_AGE_MS = 45000;
+
+async function getCachedMTFData() {
+  const now = Date.now();
+  if (_mtfCache && (now - _mtfCache.computedAt) < MTF_CACHE_MAX_AGE_MS) return _mtfCache.data;
+
+  const [m1data, m5, m15, h4data, d1data] = await Promise.all([
+    // 1500 1-minute bars = 25 hours, so a check anytime today still reaches
+    // back to this morning's 7:00 CT premarket window (see SIGNAL_PREMARKET_CONFIG).
+    loopbackGet('/api/candles?resolution=1&count=1500'),
+    loopbackGet('/api/candles?resolution=5&count=300'),
+    loopbackGet('/api/candles?resolution=15&count=300'),
+    loopbackGet('/api/candles?resolution=240&count=500'),
+    loopbackGet('/api/candles?resolution=1440&count=250'),
+  ]);
+  const data = { m1: m1data.bars || [], m5: m5.bars || [], m15: m15.bars || [], h4data, d1data };
+  _mtfCache = { data, computedAt: now };
+  return data;
+}
+
+// Computes the confirmation report for whichever of ict/orb actually fired.
+// Wrapped by the caller in try/catch — a failure here must never break the
+// ict/orb response those fields already depend on.
+async function computeSignalConfirmation(ict, orb, premarket, quote, hourlyBars) {
+  const ictFired = ict && ict.bias !== 'WAIT';
+  const orbFired = orb && orb.bias !== 'WAIT';
+  const premarketFired = premarket && premarket.bias !== 'WAIT';
+  if (!ictFired && !orbFired && !premarketFired) return null;
+
+  // Same priority ICT-over-ORB the UI already used, with the new premarket
+  // breakout signal (backtest/session_breakout_engine.js) slotted in last —
+  // it's the most rigorously validated of the three (see
+  // SIGNAL_PREMARKET_CONFIG's trackRecord) but the least frequent (Tue/Wed/
+  // Thu, 07:00-09:30 CT only), so this ordering doesn't change behavior on
+  // the vast majority of checks where it hasn't fired.
+  const bias = ictFired ? ict.bias : (orbFired ? orb.bias : premarket.bias);
+  const entryZoneOf = sig => { const size = sig.rangeBar.high - sig.rangeBar.low; return { low: Math.min(sig.entry, sig.entry - size * 0.1), high: Math.max(sig.entry, sig.entry + size * 0.1) }; };
+  const entryZone = ictFired
+    ? { low: ict.levels.oteLow, high: ict.levels.oteHigh }
+    : (orbFired ? entryZoneOf(orb) : entryZoneOf(premarket));
+
+  // m1 is the TRUE execution timeframe — this account enters/exits on the
+  // 1-minute chart, not hourly. Hourly bars stay in barsByTF as "key levels"
+  // MTF context (matching the directive's Monthly/Weekly/Daily/4H/1H/15M/5M/
+  // Execution list) but no longer stand in for the execution timeframe.
+  const { m1, m5, m15, h4data, d1data } = await getCachedMTFData();
+  const daily = (d1data.bars && d1data.bars.length) ? d1data.bars : hourlyToDaily(hourlyBars);
+  const h4 = (h4data.bars && h4data.bars.length) ? h4data.bars : hourlyToH4(hourlyBars);
+  // m1 falls back to the hourly series (still better than nothing) only if
+  // the 1-minute feed genuinely returned nothing — this account's feed has
+  // real 1m depth (verified: 200k+ bars over ~200 days via fetch_deep.js),
+  // so this fallback should not normally trigger live.
+  const executionBars = (m1 && m1.length >= 60) ? m1.slice(-1000) : hourlyBars.slice(-200);
+  const barsByTF = {
+    m1: executionBars, m5: m5 || [], m15: m15 || [], h1: hourlyBars.slice(-200), h4, d1: daily,
+    weekly: fractalEngine.aggregateToTimeframe(daily, 'week'),
+    monthly: fractalEngine.aggregateToTimeframe(daily, 'month'),
+  };
+
+  const weights = loadConfirmationWeights();
+  const report = confirmationEngine.computeConfirmation({
+    bias, quote, entryZone, executionBars, barsByTF,
+    ictResult: ictFired ? { bias: ict.bias } : null,
+    orbResult: orbFired ? { bias: orb.bias } : null,
+  }, weights);
+
+  return { ...report, note: 'Context only — does NOT gate ict/orb/premarket above. See server.js comment above computeSignalConfirmation for why gating is deferred.' };
+}
+
+let _loggedSignalsState = { dateKey: null, keys: new Set() };
+function shouldLogSignal(dateKey, key) {
+  if (_loggedSignalsState.dateKey !== dateKey) _loggedSignalsState = { dateKey, keys: new Set() };
+  if (_loggedSignalsState.keys.has(key)) return false;
+  _loggedSignalsState.keys.add(key);
+  return true;
+}
+
+function appendToSignalJournal(entry) {
+  const journalPath = path.join(ROOT, 'backtest', 'signal_journal.json');
+  let journal = [];
+  try { journal = JSON.parse(fs.readFileSync(journalPath, 'utf8')); } catch (_) {}
+  journal.push(entry);
+  fs.writeFileSync(journalPath, JSON.stringify(journal, null, 2));
+}
 
 function signalCtParts(unixSecs) {
   const d = new Date(new Date(unixSecs * 1000).toLocaleString('en-US', { timeZone: 'America/Chicago' }));
-  return { hour: d.getHours() + d.getMinutes() / 60, dateKey: d.toISOString().slice(0, 10) };
+  return { hour: d.getHours() + d.getMinutes() / 60, dateKey: d.toISOString().slice(0, 10), dow: d.getDay() };
 }
 
 async function handleSignal(req, res) {
@@ -567,6 +771,14 @@ async function handleSignal(req, res) {
       loopbackGet('/api/quote'),
     ]);
     if (!h1.bars || !h1.bars.length) return send(res, 200, { ict: null, orb: null, error: 'No candle data yet.' });
+    // Pre-existing latent bug, found while validating this session's changes:
+    // right after a server restart, latestQuote starts at {last:0,...} until
+    // the first quote poll completes. Without this guard, ORB's breakout
+    // check (`quote.last < rangeBar.low`) is trivially true for quote=0
+    // against any real price, producing a bogus SELL signal. Not something
+    // this session introduced, but a real correctness issue for a system
+    // meant to guide real capital — fixed here rather than left for later.
+    if (!quote.last || quote.last <= 0) return send(res, 200, { ict: null, orb: null, confirmation: null, error: 'No valid quote yet — server likely just started, quote stream still warming up.' });
 
     const bars = h1.bars;
     const now  = bars[bars.length - 1];
@@ -581,13 +793,22 @@ async function handleSignal(req, res) {
         else if (p.hour >= 1 && p.hour < 7) londonBars.push(b);
       }
     }
+    // PXBOT is manual-execution — no order-placement path exists — so
+    // "shipping" the breakeven-ladder exit means telling the human exactly
+    // how to manage the trade, not just showing static levels. This is the
+    // SAME levels (oteLow/oteHigh/sl/tp1/tp2/tp3) as before; only the
+    // management instructions are new.
+    const ICT_MANAGEMENT_PLAN = 'Move stop to entry (breakeven) once TP1 prints. Move stop to TP1 once TP2 prints. '
+      + 'Ride the remainder for TP3. Do not close fully at TP1/TP2 — that is the OLD exit this replaces, and it tested '
+      + 'worse (see trackRecord).';
+
     let ict = null;
     if (asiaBars.length && londonBars.length) {
       const th = { ...ictEngine.DEFAULT_THRESHOLDS, minLegSize: SIGNAL_ICT_MIN_LEG };
       const cls = ictEngine.classifyDay(asiaBars, londonBars, th);
       if (cls.id !== 0 && cls.id !== 4) {
         const levels = ictEngine.legLevels(cls.bias, cls.legLow, cls.legHigh, th);
-        ict = { scenario: cls.id, bias: cls.bias, reason: cls.reason, levels, trackRecord: ICT_TRACK_RECORD };
+        ict = { scenario: cls.id, bias: cls.bias, reason: cls.reason, levels, managementPlan: ICT_MANAGEMENT_PLAN, trackRecord: ICT_TRACK_RECORD };
       } else {
         ict = { scenario: cls.id, bias: 'WAIT', reason: cls.reason, trackRecord: ICT_TRACK_RECORD };
       }
@@ -595,8 +816,13 @@ async function handleSignal(req, res) {
 
     // --- ORB ---
     let orb = null;
-    const rangeBar = bars.slice(-30).find(b => { const p = signalCtParts(b.time); return p.dateKey === dateKey && Math.floor(p.hour) === SIGNAL_ORB_CONFIG.rangeHour; });
-    if (rangeBar) {
+    const todayDow = signalCtParts(now.time).dow;
+    const rangeBar = SIGNAL_ORB_CONFIG.allowedDaysOfWeek.includes(todayDow)
+      ? bars.slice(-30).find(b => { const p = signalCtParts(b.time); return p.dateKey === dateKey && Math.floor(p.hour) === SIGNAL_ORB_CONFIG.rangeHour; })
+      : null;
+    if (!SIGNAL_ORB_CONFIG.allowedDaysOfWeek.includes(todayDow)) {
+      orb = { bias: 'WAIT', reason: 'day-of-week filter: Monday excluded (real evidence showed avgR -0.275, 28% win rate — see trackRecord)', trackRecord: ORB_TRACK_RECORD };
+    } else if (rangeBar) {
       const size = rangeBar.high - rangeBar.low;
       if (hour <= SIGNAL_ORB_CONFIG.rangeHour + 1) {
         orb = { bias: 'WAIT', reason: 'still inside the range hour', rangeBar, trackRecord: ORB_TRACK_RECORD };
@@ -615,7 +841,81 @@ async function handleSignal(req, res) {
       }
     }
 
-    send(res, 200, { ict, orb, quote: quote.last, asOf: now.time });
+    // --- Session Breakout (NY premarket) — the third, most rigorously
+    // validated strategy (see PREMARKET_TRACK_RECORD above). Uses real
+    // 1-minute bars for the range itself, matching what was actually
+    // validated as strongest — the m1 series is already fetched/cached by
+    // getCachedMTFData for the confirmation engine, reused here for free.
+    // Wrapped in try/catch — a failure here must never break ict/orb.
+    let premarket = null;
+    try {
+      if (!SIGNAL_PREMARKET_CONFIG.allowedDaysOfWeek.includes(todayDow)) {
+        premarket = { bias: 'WAIT', reason: 'day-of-week filter: only Tue/Wed/Thu (walk-forward\'s own selectivity finding — see trackRecord)', trackRecord: PREMARKET_TRACK_RECORD };
+      } else {
+        const { m1 } = await getCachedMTFData();
+        const byDate = sessionBreakoutEngine.sliceSessions(m1 || []);
+        const todaySess = byDate.get(dateKey);
+        if (!todaySess || !todaySess.premarket.length) {
+          premarket = { bias: 'WAIT', reason: 'premarket window (07:00-09:30 CT) not available yet today', trackRecord: PREMARKET_TRACK_RECORD };
+        } else {
+          const pmHigh = Math.max(...todaySess.premarket.map(b => b.high));
+          const pmLow = Math.min(...todaySess.premarket.map(b => b.low));
+          const size = pmHigh - pmLow;
+          const rangeBar = { high: pmHigh, low: pmLow };
+          if (hour < 9.5) {
+            premarket = { bias: 'WAIT', reason: 'still inside the premarket window', rangeBar, trackRecord: PREMARKET_TRACK_RECORD };
+          } else if (size < SIGNAL_PREMARKET_CONFIG.minRangeSize) {
+            premarket = { bias: 'WAIT', reason: `range too small (< ${SIGNAL_PREMARKET_CONFIG.minRangeSize}pt floor)`, rangeBar, trackRecord: PREMARKET_TRACK_RECORD };
+          } else if (quote.last > pmHigh) {
+            const sl = pmLow - size * SIGNAL_PREMARKET_CONFIG.slBufferPct;
+            const target = quote.last + size * SIGNAL_PREMARKET_CONFIG.targetMultiple;
+            premarket = { bias: 'BUY', entry: quote.last, sl, target, rangeBar, trackRecord: PREMARKET_TRACK_RECORD };
+          } else if (quote.last < pmLow) {
+            const sl = pmHigh + size * SIGNAL_PREMARKET_CONFIG.slBufferPct;
+            const target = quote.last - size * SIGNAL_PREMARKET_CONFIG.targetMultiple;
+            premarket = { bias: 'SELL', entry: quote.last, sl, target, rangeBar, trackRecord: PREMARKET_TRACK_RECORD };
+          } else {
+            premarket = { bias: 'WAIT', reason: 'still inside the premarket range, no breakout yet', rangeBar, trackRecord: PREMARKET_TRACK_RECORD };
+          }
+        }
+      }
+    } catch (e) {
+      premarket = { bias: 'WAIT', reason: 'premarket signal failed: ' + e.message, trackRecord: PREMARKET_TRACK_RECORD };
+    }
+
+    // Confirmation engine is purely additive context — failures here must
+    // never take down the ict/orb response those fields already depend on.
+    let confirmation = null;
+    try {
+      confirmation = await computeSignalConfirmation(ict, orb, premarket, quote.last, bars);
+    } catch (e) {
+      confirmation = { error: 'confirmation engine failed: ' + e.message };
+    }
+
+    // Live signals now get logged too — previously only signal_now.js's CLI
+    // wrote to signal_journal.json, so the "self-adaptation loop"
+    // (journal_review.js) had no live-server sample to learn from at all.
+    // Same schema signal_now.js already uses (so journal_review.js's
+    // existing resolveICT/resolveORB work unmodified on these entries too),
+    // plus the new `confirmation` field attached per-signal. Deduped per
+    // (day, strategy, scenario/bias) so repeated polls of the same fired
+    // signal don't spam the journal with near-duplicates.
+    if (confirmation && !confirmation.error) {
+      const ictFiredNow = ict && ict.bias !== 'WAIT';
+      const orbFiredNow = orb && orb.bias !== 'WAIT';
+      const premarketFiredNow = premarket && premarket.bias !== 'WAIT';
+      const logKey = ictFiredNow ? `${dateKey}-ICT-${ict.scenario}-${ict.bias}`
+        : (orbFiredNow ? `${dateKey}-ORB-${orb.bias}` : (premarketFiredNow ? `${dateKey}-PREMARKET-${premarket.bias}` : null));
+      if (logKey && shouldLogSignal(dateKey, logKey)) {
+        const signals = [];
+        if (ictFiredNow) signals.push({ strategy: 'ICT-leg-filter', scenario: ict.scenario, bias: ict.bias, levels: ict.levels, trackRecord: ICT_TRACK_RECORD, confirmation });
+        else if (orbFiredNow) signals.push({ strategy: 'ORB', bias: orb.bias, entry: orb.entry, sl: orb.sl, target: orb.target, trackRecord: ORB_TRACK_RECORD, confirmation });
+        else if (premarketFiredNow) signals.push({ strategy: 'PREMARKET', bias: premarket.bias, entry: premarket.entry, sl: premarket.sl, target: premarket.target, trackRecord: PREMARKET_TRACK_RECORD, confirmation });
+        appendToSignalJournal({ time: now.time, checkedAt: Date.now(), quote: quote.last, signals });
+      }
+    }
+
+    send(res, 200, { ict, orb, premarket, confirmation, quote: quote.last, asOf: now.time });
   } catch (e) {
     send(res, 500, { error: e.message });
   }
@@ -1229,50 +1529,34 @@ async function handleTVContext(req, res) {
     const bars1D  = data['1440'] || [];
 
     // Swing H/L detection on daily bars — ICT external liquidity levels
-    const swings = [];
-    for (let i = 2; i < bars1D.length - 2; i++) {
-      const b = bars1D[i];
-      if (b.high > bars1D[i-1].high && b.high > bars1D[i-2].high && b.high > bars1D[i+1].high && b.high > bars1D[i+2].high)
-        swings.push({ type:'SH', price: +b.high.toFixed(2), nqAdj: +(b.high-150).toFixed(2), date: new Date(b.time*1000).toLocaleDateString() });
-      if (b.low < bars1D[i-1].low && b.low < bars1D[i-2].low && b.low < bars1D[i+1].low && b.low < bars1D[i+2].low)
-        swings.push({ type:'SL', price: +b.low.toFixed(2), nqAdj: +(b.low-150).toFixed(2), date: new Date(b.time*1000).toLocaleDateString() });
-    }
+    // (engine/structure_engine.js — consolidated, same 2-bar-lookback algorithm this used inline before)
+    const swings = structureEngine.findSwingPoints(bars1D, 2).map(s => ({
+      type: s.type, price: +s.price.toFixed(2), nqAdj: +(s.price - 150).toFixed(2),
+      date: new Date(s.bar.time * 1000).toLocaleDateString(),
+    }));
 
     // EQH/EQL detection — equal highs/lows within 10pts on daily (liquidity pools)
-    const eqLevels = [];
-    for (let i = 0; i < bars1D.length - 1; i++) {
-      for (let j = i+1; j < Math.min(i+10, bars1D.length); j++) {
-        if (Math.abs(bars1D[i].high - bars1D[j].high) < 10)
-          eqLevels.push({ type:'EQH', price: +((bars1D[i].high+bars1D[j].high)/2).toFixed(2), dates: [new Date(bars1D[i].time*1000).toLocaleDateString(), new Date(bars1D[j].time*1000).toLocaleDateString()] });
-        if (Math.abs(bars1D[i].low - bars1D[j].low) < 10)
-          eqLevels.push({ type:'EQL', price: +((bars1D[i].low+bars1D[j].low)/2).toFixed(2), dates: [new Date(bars1D[i].time*1000).toLocaleDateString(), new Date(bars1D[j].time*1000).toLocaleDateString()] });
-      }
-    }
+    const eqLevels = structureEngine.findEqualLevels(bars1D, 10, 10).map(e => ({
+      type: e.type, price: +e.price.toFixed(2),
+      dates: [new Date(e.barI.time * 1000).toLocaleDateString(), new Date(e.barJ.time * 1000).toLocaleDateString()],
+    }));
 
     // ATR(14) on daily bars for volatility context
     let atr14d = null;
     if (bars1D.length >= 15) {
-      const trs = bars1D.slice(-15).map((b,i,a)=> i===0 ? b.high-b.low : Math.max(b.high-b.low,Math.abs(b.high-a[i-1].close),Math.abs(b.low-a[i-1].close)));
-      atr14d = +(trs.slice(-14).reduce((a,b)=>a+b,0)/14).toFixed(1);
+      atr14d = +structureEngine.atr(bars1D, 14).toFixed(1);
     }
 
     // Weekly profile — last 10 weeks, each week's open/high/low/close/range
     const weeklyProfile = [];
     if (bars1D.length > 5) {
-      let wStart = 0;
-      while (wStart < bars1D.length) {
-        const wSlice = bars1D.slice(wStart, wStart+5);
-        if (wSlice.length >= 1) {
-          weeklyProfile.push({
-            weekStart: new Date(wSlice[0].time*1000).toLocaleDateString(),
-            open:  +wSlice[0].open.toFixed(2), close: +wSlice[wSlice.length-1].close.toFixed(2),
-            high:  +Math.max(...wSlice.map(b=>b.high)).toFixed(2),
-            low:   +Math.min(...wSlice.map(b=>b.low)).toFixed(2),
-            range: +(Math.max(...wSlice.map(b=>b.high)) - Math.min(...wSlice.map(b=>b.low))).toFixed(1),
-            bias:  wSlice[wSlice.length-1].close > wSlice[0].open ? 'BULL' : 'BEAR',
-          });
-        }
-        wStart += 5;
+      for (const w of structureEngine.weeklyProfile(bars1D, 5)) {
+        weeklyProfile.push({
+          weekStart: new Date(w.weekStartTime * 1000).toLocaleDateString(),
+          open: +w.open.toFixed(2), close: +w.close.toFixed(2),
+          high: +w.high.toFixed(2), low: +w.low.toFixed(2), range: +w.range.toFixed(1),
+          bias: w.bias,
+        });
       }
     }
 

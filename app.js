@@ -1364,8 +1364,19 @@ function renderFibTable(high, low, bias) {
 }
 
 // ─── Market Structure Engine ──────────────────────────────────────────────────
-// Detects BOS, CHOCH, MSS, Equal Highs/Lows from raw candle array
+// Detects BOS, CHOCH, MSS, Equal Highs/Lows from raw candle array.
+// Delegates to engine/structure_engine.js (loaded via <script> in index.html,
+// shared with server.js/sandbox/build.js so this logic exists in exactly one
+// place) when available; falls back to the inline copy below if the shared
+// script didn't load, so this never becomes a hard dependency.
 function detectStructure(candles) {
+  if (typeof window !== 'undefined' && window.StructureEngine && window.StructureEngine.detectStructure) {
+    return window.StructureEngine.detectStructure(candles);
+  }
+  return detectStructureInline(candles);
+}
+
+function detectStructureInline(candles) {
   if (candles.length < 10) return { swingHighs: [], swingLows: [], bosPoints: [], chochPoints: [], eqHighs: [], eqLows: [] };
 
   // ── Find swing highs / lows (3-bar lookback each side) ─────────────────────
@@ -2829,48 +2840,58 @@ async function runAISignal() {
     const dsEl = $('aiDataSource');
     if (dsEl) { dsEl.textContent = 'LIVE TL DATA'; dsEl.className = 'pill green-pill'; }
 
-    const ict = sig.ict, orb = sig.orb;
+    const ict = sig.ict, orb = sig.orb, premarket = sig.premarket;
     const ictFired = ict && ict.bias !== 'WAIT';
     const orbFired = orb && orb.bias !== 'WAIT';
+    const premarketFired = premarket && premarket.bias !== 'WAIT';
 
+    // Confirmation engine (server.js:computeSignalConfirmation) — additive
+    // context only, does not change ict/orb above. Falls back to the
+    // original null/false behavior if a server without this field is ever
+    // hit, so this stays backward compatible.
+    const conf = (sig.confirmation && !sig.confirmation.error) ? sig.confirmation : null;
+    const factorAgrees = name => !!conf?.factors?.find(f => f.name === name && f.agrees === true);
+    const confFields = conf ? {
+      confidence: conf.confidence,
+      confluence_score: `${conf.tier} · ${conf.confidence}% (${conf.agreeingCount} of ${conf.factors.length - (conf.factors.filter(f=>f.excluded).length)} confirmations agree)`,
+      order_block_in_ote: factorAgrees('orderBlockConfluence'),
+      fvg_in_ote: factorAgrees('fvgConfluence'),
+      premium_discount_aligned: factorAgrees('dailyPricePosition') || factorAgrees('mtfFractalAlignment'),
+    } : { confidence: null, confluence_score: null, order_block_in_ote: false, fvg_in_ote: false, premium_discount_aligned: false };
+
+    // Only the premarket breakout is shown as an actionable trade — it's the
+    // only one of the three that passed every validation check without a
+    // real caveat attached to the core number (see PREMARKET_TRACK_RECORD).
+    // ICT (thin held-out sample, negative on the bigger test) and ORB
+    // (currently losing in the most recent weeks tested) still compute and
+    // log to the journal every check — server.js unchanged, still gathering
+    // real evidence in case either one's picture improves — but neither
+    // surfaces as something to trade right now. Fewer signals, on purpose.
     let json;
-    if (ictFired) {
-      const lv = ict.levels;
-      const entryMid = (lv.oteLow + lv.oteHigh) / 2;
-      const risk = Math.abs(entryMid - lv.sl);
+    if (premarketFired) {
+      const risk = Math.abs(premarket.entry - premarket.sl);
       json = {
-        scenario: ict.scenario, scenario_name: (SCENARIOS[ict.scenario]?.name || ('S' + ict.scenario)) + ' (validated engine)',
-        bias: ict.bias, wait_reason: null,
-        entry_window: 'nyopen', entry_window_note: 'ICT leg-filter (leg≥199pt) — enter on the OTE pullback.',
-        ote_entry_low: lv.oteLow, ote_entry_high: lv.oteHigh,
-        stop: lv.sl, target: lv.tp2, stop_pts: +risk.toFixed(2), target_pts: +Math.abs(lv.tp2 - entryMid).toFixed(2),
-        tp1: lv.tp1, tp2: lv.tp2, tp3: lv.tp3,
-        tp1_pts: +Math.abs(lv.tp1 - entryMid).toFixed(2), tp2_pts: +Math.abs(lv.tp2 - entryMid).toFixed(2), tp3_pts: +Math.abs(lv.tp3 - entryMid).toFixed(2),
-        rr: +(Math.abs(lv.tp2 - entryMid) / Math.max(0.25, risk)).toFixed(1),
-        confidence: null,
-        reasoning: `Validated ICT leg-filter engine: ${ict.reason}. Track record: ${ict.trackRecord}` + (orbFired ? ` [ORB also fired this bar — see below]` : ''),
-        invalidation: lv.sl,
-      };
-    } else if (orbFired) {
-      const risk = Math.abs(orb.entry - orb.sl);
-      json = {
-        scenario: 0, scenario_name: 'Opening Range Breakout (validated engine)',
-        bias: orb.bias, wait_reason: null,
-        entry_window: 'nyopen', entry_window_note: 'ORB breakout of the 9–10 AM CT range — already triggered, this is a market entry.',
-        ote_entry_low: orb.entry, ote_entry_high: orb.entry,
-        stop: orb.sl, target: orb.target, stop_pts: +risk.toFixed(2), target_pts: +Math.abs(orb.target - orb.entry).toFixed(2),
-        tp1: 0, tp2: orb.target, tp3: 0,
-        tp1_pts: 0, tp2_pts: +Math.abs(orb.target - orb.entry).toFixed(2), tp3_pts: 0,
-        rr: +(Math.abs(orb.target - orb.entry) / Math.max(0.25, risk)).toFixed(1),
-        confidence: null,
-        reasoning: `Validated ORB engine: breakout of the opening range. Track record: ${orb.trackRecord}`,
-        invalidation: orb.sl,
+        scenario: 0, scenario_name: 'NY Premarket Breakout (validated engine — strongest evidence)',
+        bias: premarket.bias, wait_reason: null,
+        entry_window: 'premarket', entry_window_note: 'Breakout of the 7:00-9:30 AM CT premarket range — already triggered, this is a market entry. Tue/Wed/Thu only.',
+        ote_entry_low: premarket.entry, ote_entry_high: premarket.entry,
+        stop: premarket.sl, target: premarket.target, stop_pts: +risk.toFixed(2), target_pts: +Math.abs(premarket.target - premarket.entry).toFixed(2),
+        tp1: 0, tp2: premarket.target, tp3: 0,
+        tp1_pts: 0, tp2_pts: +Math.abs(premarket.target - premarket.entry).toFixed(2), tp3_pts: 0,
+        rr: +(Math.abs(premarket.target - premarket.entry) / Math.max(0.25, risk)).toFixed(1),
+        ...confFields,
+        reasoning: `Validated NY premarket breakout: real-1-minute-execution confirmed, 5/5 walk-forward folds profitable. Track record: ${premarket.trackRecord}`
+          + (conf ? ` | Confirmation engine: ${conf.tier} tier, ${conf.confidence}% confidence (${conf.agreeingCount} agree / ${conf.disagreeingCount} disagree) — context only, not a live-validated gate yet.` : ''),
+        invalidation: premarket.sl,
       };
     } else {
+      const heldBackNote = (ictFired || orbFired)
+        ? ` (ICT and/or ORB did fire today, but are intentionally not shown as trades right now — weaker/mixed evidence, kept as background research only. See the rundown for why.)`
+        : '';
       json = {
         scenario: 0, scenario_name: 'No signal', bias: 'WAIT',
-        wait_reason: `ICT: ${ict ? ict.reason : 'not enough Asia/London data yet today'}. ORB: ${orb ? orb.reason : 'range hour not available yet today'}.`,
-        reasoning: 'Neither validated approach has a live signal right now — this is the honest answer, not a placeholder.',
+        wait_reason: `Premarket: ${premarket ? premarket.reason : 'not available yet today'}.${heldBackNote}`,
+        reasoning: 'Only trading the premarket breakout right now — the one strategy with real evidence behind it at every check applied. Fewer signals, on purpose.',
       };
     }
 
@@ -2906,6 +2927,23 @@ function applyAISignal(json) {
   state.fibLow     = low;
   state.fibBias    = bias === 'WAIT' ? 'WAIT' : bias;
   state.scenarioId = id;
+
+  // Confirmation-engine confidence bar (engine/confirmation_engine.js, via
+  // server.js:computeSignalConfirmation) — was permanently hidden before
+  // since confidence was always hardcoded null; now shows the real score
+  // when the server provides one, hidden otherwise (backward compatible).
+  const confEl = $('aiConfidence');
+  if (confEl) {
+    const confidence = Number(json.confidence);
+    if (json.confidence !== null && json.confidence !== undefined && !Number.isNaN(confidence)) {
+      confEl.style.display = 'flex';
+      const fillEl = $('confFill'), pctEl = $('confPct');
+      if (fillEl) fillEl.style.width = Math.max(0, Math.min(100, confidence)) + '%';
+      if (pctEl) pctEl.textContent = confidence.toFixed(0) + '%';
+    } else {
+      confEl.style.display = 'none';
+    }
+  }
 
   // Scenario panel
   const sName = json.scenario_name || (SCENARIOS[id] ? SCENARIOS[id].name : 'AI Signal');
