@@ -95,6 +95,12 @@ const BACKTESTED = {
   // most recent 6-7 weeks tested show decay, currently worse than the prior
   // config there — see server.js:ORB_TRACK_RECORD for the full picture.
   'ORB':            { avgR: 0.056, n: 299, label: 'walk-forward 4/5 folds profitable, config picked in every fold; recent-period decay flagged separately' },
+  // NY premarket range breakout, Tue/Wed/Thu only — the most rigorously
+  // validated of the three: 5/5 walk-forward folds profitable AND confirmed
+  // at real 1-minute execution (0.122R hourly-approx vs 0.108-0.115R real —
+  // the precise test agrees with the coarse one, unlike ICT/ORB above).
+  // See server.js:PREMARKET_TRACK_RECORD for the full picture including caveats.
+  'PREMARKET':      { avgR: 0.11, n: 83, label: 'real 1m-execution OOS, confirmed by hourly-approximated walk-forward (5/5 folds); strongest evidence this session, still not a guarantee' },
 };
 
 // ── Human-in-the-loop confirmation-weight learning ─────────────────────────
@@ -209,7 +215,10 @@ function reviewConfirmationFactors(journal) {
       const bars = (data.bars || []).filter(b => b.time > entry.time);
       if (!bars.length) { stillPending++; continue; }
 
-      const result = sig.strategy === 'ORB' ? resolveORB(sig, bars) : resolveICT(sig, bars);
+      // PREMARKET uses the same single-shot entry/sl/target shape ORB does
+      // (session_breakout_engine.js:simulateBreakout — no managed exit),
+      // unlike ICT's OTE-zone/breakeven-ladder shape.
+      const result = (sig.strategy === 'ORB' || sig.strategy === 'PREMARKET') ? resolveORB(sig, bars) : resolveICT(sig, bars);
       if (result.status === 'resolved') {
         sig.outcome = result.outcome;
         sig.actualR = +result.r.toFixed(3);

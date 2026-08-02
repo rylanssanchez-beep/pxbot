@@ -2840,9 +2840,10 @@ async function runAISignal() {
     const dsEl = $('aiDataSource');
     if (dsEl) { dsEl.textContent = 'LIVE TL DATA'; dsEl.className = 'pill green-pill'; }
 
-    const ict = sig.ict, orb = sig.orb;
+    const ict = sig.ict, orb = sig.orb, premarket = sig.premarket;
     const ictFired = ict && ict.bias !== 'WAIT';
     const orbFired = orb && orb.bias !== 'WAIT';
+    const premarketFired = premarket && premarket.bias !== 'WAIT';
 
     // Confirmation engine (server.js:computeSignalConfirmation) — additive
     // context only, does not change ict/orb above. Falls back to the
@@ -2894,11 +2895,27 @@ async function runAISignal() {
           + (conf ? ` | Confirmation engine: ${conf.tier} tier, ${conf.confidence}% confidence (${conf.agreeingCount} agree / ${conf.disagreeingCount} disagree) — context only, not a live-validated gate yet.` : ''),
         invalidation: orb.sl,
       };
+    } else if (premarketFired) {
+      const risk = Math.abs(premarket.entry - premarket.sl);
+      json = {
+        scenario: 0, scenario_name: 'NY Premarket Breakout (validated engine — strongest evidence)',
+        bias: premarket.bias, wait_reason: null,
+        entry_window: 'premarket', entry_window_note: 'Breakout of the 7:00-9:30 AM CT premarket range — already triggered, this is a market entry. Tue/Wed/Thu only.',
+        ote_entry_low: premarket.entry, ote_entry_high: premarket.entry,
+        stop: premarket.sl, target: premarket.target, stop_pts: +risk.toFixed(2), target_pts: +Math.abs(premarket.target - premarket.entry).toFixed(2),
+        tp1: 0, tp2: premarket.target, tp3: 0,
+        tp1_pts: 0, tp2_pts: +Math.abs(premarket.target - premarket.entry).toFixed(2), tp3_pts: 0,
+        rr: +(Math.abs(premarket.target - premarket.entry) / Math.max(0.25, risk)).toFixed(1),
+        ...confFields,
+        reasoning: `Validated NY premarket breakout: real-1-minute-execution confirmed, 5/5 walk-forward folds profitable. Track record: ${premarket.trackRecord}`
+          + (conf ? ` | Confirmation engine: ${conf.tier} tier, ${conf.confidence}% confidence (${conf.agreeingCount} agree / ${conf.disagreeingCount} disagree) — context only, not a live-validated gate yet.` : ''),
+        invalidation: premarket.sl,
+      };
     } else {
       json = {
         scenario: 0, scenario_name: 'No signal', bias: 'WAIT',
-        wait_reason: `ICT: ${ict ? ict.reason : 'not enough Asia/London data yet today'}. ORB: ${orb ? orb.reason : 'range hour not available yet today'}.`,
-        reasoning: 'Neither validated approach has a live signal right now — this is the honest answer, not a placeholder.',
+        wait_reason: `ICT: ${ict ? ict.reason : 'not enough Asia/London data yet today'}. ORB: ${orb ? orb.reason : 'range hour not available yet today'}. Premarket: ${premarket ? premarket.reason : 'not available yet today'}.`,
+        reasoning: 'None of the three validated approaches have a live signal right now — this is the honest answer, not a placeholder.',
       };
     }
 
