@@ -174,16 +174,34 @@ function tradesFromSessionReversion(bars, params) {
   return out;
 }
 
+const regimeEngine = require('../engine/regime_engine');
+
 function tradesFromSessionBreakout(bars, params) {
   const th = { ...sessionBreakout.DEFAULT_THRESHOLDS, ...params };
   const byDate = sessionBreakout.sliceSessions(bars);
   const FORWARD_AFTER = { asia: ['london', 'premarket', 'ny', 'forward'], london: ['premarket', 'ny', 'forward'], premarket: ['ny', 'forward'] };
   const forwardBuckets = FORWARD_AFTER[th.anchor];
   const out = [];
+  // Same regime pre-filter session_breakout_engine.js's own
+  // runSessionBreakoutBacktest supports (minTrendEfficiency>0) — round 1
+  // never swept this; round 2 does. Only built when actually in use.
+  let timeToIndex = null;
+  if (th.minTrendEfficiency > 0) {
+    timeToIndex = new Map();
+    for (let i = 0; i < bars.length; i++) timeToIndex.set(bars[i].time, i);
+  }
   for (const [date, sess] of byDate.entries()) {
     if (!th.allowedDaysOfWeek.includes(sess.dow)) continue;
     const anchorBars = sess[th.anchor];
     if (!anchorBars || !anchorBars.length) continue;
+    if (th.minTrendEfficiency > 0) {
+      const lastAnchorBar = anchorBars[anchorBars.length - 1];
+      const idx = timeToIndex.get(lastAnchorBar.time);
+      if (idx === undefined) continue;
+      const regimeWindow = bars.slice(Math.max(0, idx + 1 - th.regimeLookback), idx + 1);
+      const regime = regimeEngine.classifyRegime(regimeWindow, { ...regimeEngine.DEFAULT_THRESHOLDS, erLookback: th.regimeLookback });
+      if (regime.efficiencyRatio === null || regime.efficiencyRatio < th.minTrendEfficiency) continue;
+    }
     const range = { high: Math.max(...anchorBars.map(b => b.high)), low: Math.min(...anchorBars.map(b => b.low)) };
     const size = range.high - range.low;
     if (size <= 0 || size < th.minRangeSize) continue;
@@ -229,7 +247,7 @@ function grid(paramLists) {
 const CANDIDATES = {
   trend_pullback: {
     fn: tradesFromTrendPullback,
-    grid: grid({ minTrendEfficiency: [0.3, 0.4, 0.5], pullbackAtrMultiple: [0.5, 1.0, 1.5], targetRMultiple: [1, 1.5, 2], allowedDaysOfWeek: Object.values(DAY_FILTERS) }),
+    grid: grid({ minTrendEfficiency: [0.2, 0.3, 0.4, 0.5, 0.6], pullbackAtrMultiple: [0.5, 1.0, 1.5], targetRMultiple: [1, 1.5, 2], allowedDaysOfWeek: Object.values(DAY_FILTERS) }),
   },
   vwap_reversion: {
     fn: tradesFromVwapReversion,
@@ -253,11 +271,11 @@ const CANDIDATES = {
   },
   session_breakout_asia: {
     fn: tradesFromSessionBreakout,
-    grid: grid({ anchor: ['asia'], targetMultiple: [0.5, 1, 1.5], slBufferPct: [0.05, 0.1], minRangeSize: [0, 60], allowedDaysOfWeek: Object.values(DAY_FILTERS) }),
+    grid: grid({ anchor: ['asia'], targetMultiple: [0.5, 1, 1.5], slBufferPct: [0.05, 0.1], minRangeSize: [0, 60], allowedDaysOfWeek: Object.values(DAY_FILTERS), minTrendEfficiency: [0, 0.3, 0.4, 0.5], regimeLookback: [20] }),
   },
   session_breakout_london: {
     fn: tradesFromSessionBreakout,
-    grid: grid({ anchor: ['london'], targetMultiple: [0.5, 1, 1.5], slBufferPct: [0.05, 0.1], minRangeSize: [0, 60], allowedDaysOfWeek: Object.values(DAY_FILTERS) }),
+    grid: grid({ anchor: ['london'], targetMultiple: [0.5, 1, 1.5], slBufferPct: [0.05, 0.1], minRangeSize: [0, 60], allowedDaysOfWeek: Object.values(DAY_FILTERS), minTrendEfficiency: [0, 0.3, 0.4, 0.5], regimeLookback: [20] }),
   },
 };
 
@@ -347,8 +365,12 @@ function runWalkForward(label, bars, spec) {
     require.resolve('./liquidity_sweep_engine'), require.resolve('./session_reversion_engine'), require.resolve('./session_breakout_engine'),
   ]);
 
+  const only = (process.argv.find(a => a.startsWith('--only=')) || '').split('=')[1];
+  const wanted = only ? only.split(',') : Object.keys(CANDIDATES);
+
   const results = {};
   for (const [label, spec] of Object.entries(CANDIDATES)) {
+    if (!wanted.includes(label)) continue;
     console.log(`=== ${label} (grid size ${spec.grid.length}) ===`);
     const r = runWalkForward(label, hourlyBars, spec);
     results[label] = r;

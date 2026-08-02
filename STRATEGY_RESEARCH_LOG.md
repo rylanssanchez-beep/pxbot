@@ -108,13 +108,41 @@ evidence for a system being proposed as better than the baseline. The distinctio
 the "trades tested" number while having zero accepted candidates would be exactly the kind of
 trade-count-inflation the mission prohibits.
 
-## Next steps
+## Round 2 — widened trend_pullback / session_breakout grids + regime filter
 
-1. Widen the trend_pullback / session_breakout grids and try a regime filter (`engine/regime_engine.js`
-   is already wired into `trend_pullback_engine.js`'s efficiency-ratio filter but not yet swept
-   across a wider threshold range).
-2. Re-test liquidity_sweep / session_reversion at 1-minute execution precision once justified by
-   available 1-minute history depth, with the explicit caveat above addressed rather than assumed.
-3. Consider ensemble/ranking approaches only after at least one individual family clears the
-   walk-forward + holdout bar on its own — combining several already-rejected mechanisms would not
-   manufacture a real edge.
+**Reproduce:** `node backtest/research_phase5.js --only=trend_pullback,session_breakout_asia,session_breakout_london`
+
+Round 1's "next steps" suggested widening `trend_pullback`'s efficiency-ratio threshold range and
+adding `session_breakout_engine.js`'s existing (but unswept in round 1) `minTrendEfficiency` regime
+pre-filter to the breakout candidates. Done — `minTrendEfficiency ∈ {0, 0.3, 0.4, 0.5}` added to
+both session_breakout anchors (grid size 36→144), `minTrendEfficiency` range widened from
+`{0.3,0.4,0.5}` to `{0.2,...,0.6}` for trend_pullback (grid size 81→135).
+
+| Candidate | Valid folds | Profitable OOS folds | Distinct configs | Combined OOS avgR (n) | Verdict |
+|---|---|---|---|---|---|
+| trend_pullback (wider grid) | 5 | 2 | 2 | +0.028R (n=30) | REJECTED — still not a majority (2/5); OOS avgR *fell* vs. round 1's 0.105R |
+| session_breakout (Asia, +regime filter) | 5 | 2 | 4 | -0.133R (n=52) | REJECTED — still not a majority (2/5) |
+| session_breakout (London, +regime filter) | 5 | 0 | 5 | -0.117R (n=112) | REJECTED — got worse (was 1/5, now 0/5), configs got less stable (5 distinct vs. 4) |
+
+**The regime filter did not help either candidate — it made session_breakout_london's result both
+more negative and less stable.** Reported here in full rather than only reporting round 1, because
+silently dropping a round that didn't confirm the hoped-for improvement would itself be a form of
+cherry-picking. Two full rounds (11 total candidate/anchor configurations) have now failed to beat
+the frozen baseline. Per Part 7's multiple-testing awareness — "the more variants tested, the
+stronger the evidence required" — continuing to widen grids indefinitely in search of *any* passing
+configuration would itself become the overfitting risk this process exists to prevent, not a
+legitimate next step.
+
+**Recommended direction from here**, in priority order:
+1. Stop searching for brand-new independent strategy families for now. ORB is the one mechanism in
+   this entire codebase with a demonstrated, real, stable edge (`CURRENT_STRATEGY_BASELINE.md`:
+   n=301, PF 1.134, positive in 19/31 months). Spend the next round refining and stress-testing
+   *that* mechanism specifically (different range-defining hours, target multiples, stop models)
+   rather than continuing to sample new mechanisms broadly.
+2. Re-test liquidity_sweep / session_reversion at real 1-minute execution precision once that's
+   justified by available history depth (currently ~267 days) — the hourly-resolution caveat above
+   is real and unresolved, not dismissed.
+3. Revisit PREMARKET's exit model (Part 6: partials, ATR trailing, structure targets) now that the
+   19:00 CT exit-timing bug is fixed and it's back to a small positive edge — there may be more
+   there with a better-designed exit than either extreme (15:00 forced close vs. ride-to-19:00) tried
+   so far.
