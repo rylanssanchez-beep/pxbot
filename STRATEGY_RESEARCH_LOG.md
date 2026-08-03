@@ -455,6 +455,41 @@ operator's real constraint depends on whether the 30pt cap is a literal stop-dis
 their prop firm (rare) or a dollar-risk habit expressed in points (common) — an operator question,
 not a research question.
 
+## Round 8 — the 90%-win-rate frontier, mapped and closed
+
+**Reproduce:** `node backtest/research_phase5.js --only=asia_fade_widestop,london_fade_widestop,lunch_fade_widestop --spread=1.32`
+
+The dollar-risk clarification unlocked wide-stop fades (50–80pt stops, sized down in contracts;
+10–20pt targets). Three windows tested with the winRate-constrained selector:
+
+| Candidate | Folds | Trades | Win rate | RR | Expectancy | Verdict |
+|---|---|---|---|---|---|---|
+| asia_fade_widestop | 1/5 | 89 | 77.53% | 0.194 | -0.0668R | REJECTED — wider stops LOWERED win rate (87→78%): wins shrank in R faster than losses thinned |
+| london_fade_widestop | 0/5 | 92 | 78.26% | 0.180 | -0.0753R | REJECTED |
+| **lunch_fade_widestop** | **5/5** | 119 (dev) + 36 (holdout) | **94.96% dev / 91.67% holdout** | 0.109 / 0.071 | +0.0361R dev / **-0.0189R holdout** | **REJECTED — the holdout lost money at a 91.7% win rate: 3 losses erased 33 wins** |
+
+**The operator's request — a strategy that "wins 90% and higher" — was found.** The NY-lunch range
+fade won 94.96% of 119 walk-forward trades and 91.67% of 36 untouched holdout trades. The win rate
+is real and stable. **And it is not profitable**: average win ~0.07R, average loss ~1R, so the
+holdout's 3 losses outweighed its 33 wins. The dev/holdout straddle (+0.036R / -0.019R) is exactly
+the signature of a zero-edge process — the gates worked precisely as designed.
+
+**The high-win-rate frontier on this instrument/feed/window is now mapped at four independent
+points** (87% @ RR 0.13 → -0.02R; 78% @ RR 0.19 → -0.07R; 78% @ RR 0.18 → -0.08R; 92–95% @ RR
+0.07–0.11 → ≈0R minus costs), all breakeven-or-negative after real measured costs. The market
+prices these fades efficiently: any win rate is purchasable, and the price is the edge itself.
+**Continuing to re-roll this specific question is now data mining, not research** — the posterior
+is settled unless something material changes (substantially deeper history, materially tighter
+measured costs, or a different instrument). Near-miss candidates (prevday_fixedstop, the fades)
+remain legitimately re-testable as genuinely NEW 1m data accumulates month by month — that is new
+evidence, not a re-roll. New mechanism families (displacement, breaker structures, news-window
+avoidance overlays) also remain open, judged by expectancy first.
+
+What stands validated and live remains the honest answer: the hourly FVG system (58% WR, +0.091R,
+funded-MC-tested, DEMO-FIRST, integrated in the app) — and the path to the operator's 2–3
+trades/day is stacking additional validated modules over time, not forcing a win-rate number the
+market has now repeatedly refused to pay for.
+
 ## Trade-frequency math for the 1,000-trade target
 
 At a practical operating cadence (~2 trades/day, ~250 trading days/year), 1,000 trades needs about
