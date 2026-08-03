@@ -634,8 +634,13 @@ function tradesFromMicroOrb1m(bars, params) {
 // session end as a genuine TIME exit (London 1m bars appended past the
 // hold cap).
 function tradesFromAsiaFade1m(bars, params) {
-  const th = { rangeMinutes: 60, stopPoints: 20, targetPoints: 12, minRangeSize: 20, allowedDaysOfWeek: [0, 1, 2, 3, 4, 5, 6], ...params };
-  if (th.stopPoints > MAX_STOP_POINTS) return []; // config itself violates the cap — untradeable, zero trades
+  const th = { rangeMinutes: 60, stopPoints: 20, targetPoints: 12, minRangeSize: 20, allowedDaysOfWeek: [0, 1, 2, 3, 4, 5, 6], enforceStopCap: true, ...params };
+  // The 30pt cap was later clarified by the operator to be a DOLLAR-risk cap,
+  // not a stop-distance rule — wider stops are affordable at reduced contract
+  // size. Candidates defined under the original literal reading keep
+  // enforceStopCap:true (their validated behavior is unchanged); round-8
+  // wide-stop variants pass enforceStopCap:false explicitly.
+  if (th.enforceStopCap !== false && th.stopPoints > MAX_STOP_POINTS) return [];
   const byDay = new Map();
   for (const b of bars) {
     const { hour } = ctParts(b.time);
@@ -677,6 +682,61 @@ function tradesFromAsiaFade1m(bars, params) {
       precomputedEntryIndex: 0, precomputedEntryPriceRaw: entryPrice,
       stopPrice: sl, targetPrice: target,
       exitPlan: { maxHoldingBars: Math.max(1, asiaExec.length - 1) }, costModel: COST_MODEL,
+    });
+    if (r.filled) out.push(r);
+  }
+  return out;
+}
+
+// ── Generic intra-window range fade on 1m (round 8) — the same high-win-
+// rate fade shape as tradesFromAsiaFade1m, parameterized to any same-day
+// CT window (London 01:00-07:00, NY lunch, etc.), with the dollar-risk
+// clarification applied: wide fixed stops are allowed (size down in
+// contracts), small fixed targets. First `rangeMinutes` of the window set
+// the range; the first touch of an extreme fades back toward the interior;
+// exit at window end as a genuine TIME exit (the next `tailMinutes` of
+// bars are appended past the hold cap so the label is TIME, never a
+// silently-excluded END_OF_DATA).
+function tradesFromWindowFade1m(bars, params) {
+  const th = { windowStartH: 1, windowEndH: 7, rangeMinutes: 60, stopPoints: 50, targetPoints: 15, minRangeSize: 20, tailMinutes: 120, allowedDaysOfWeek: [1, 2, 3, 4, 5], ...params };
+  const byDate = new Map();
+  for (const b of bars) {
+    const { hour, dateKey, dow } = ctParts(b.time);
+    if (!byDate.has(dateKey)) byDate.set(dateKey, { win: [], tail: [], dow });
+    const day = byDate.get(dateKey);
+    if (hour >= th.windowStartH && hour < th.windowEndH) day.win.push(b);
+    else if (hour >= th.windowEndH && hour < th.windowEndH + th.tailMinutes / 60) day.tail.push(b);
+  }
+  const out = [];
+  for (const [dateKey, day] of byDate.entries()) {
+    if (!th.allowedDaysOfWeek.includes(day.dow)) continue;
+    if (day.win.length <= th.rangeMinutes) continue;
+    const rangeBars = day.win.slice(0, th.rangeMinutes);
+    const rest = day.win.slice(th.rangeMinutes);
+    const hi = Math.max(...rangeBars.map(b => b.high));
+    const lo = Math.min(...rangeBars.map(b => b.low));
+    const size = hi - lo;
+    if (size <= 0 || size < th.minRangeSize) continue;
+
+    let bias = null, entryIdx = -1, entryPrice = null;
+    for (let k = 0; k < rest.length; k++) {
+      const b = rest[k];
+      const touchedHi = b.high >= hi, touchedLo = b.low <= lo;
+      if (touchedHi && touchedLo) break; // one bar through both sides — no clean read
+      if (touchedHi) { bias = 'SHORT'; entryPrice = hi; entryIdx = k; break; }
+      if (touchedLo) { bias = 'LONG'; entryPrice = lo; entryIdx = k; break; }
+    }
+    if (!bias) continue;
+
+    const sl = bias === 'SHORT' ? entryPrice + th.stopPoints : entryPrice - th.stopPoints;
+    const target = bias === 'SHORT' ? entryPrice - th.targetPoints : entryPrice + th.targetPoints;
+    const winExec = rest.slice(entryIdx);
+    const execBars = [...winExec, ...day.tail];
+    const r = simulateTrade({
+      bars: execBars, signalIndex: -1, direction: bias, orderType: 'preComputedFill',
+      precomputedEntryIndex: 0, precomputedEntryPriceRaw: entryPrice,
+      stopPrice: sl, targetPrice: target,
+      exitPlan: { maxHoldingBars: Math.max(1, winExec.length - 1) }, costModel: COST_MODEL,
     });
     if (r.filled) out.push(r);
   }
@@ -1032,6 +1092,25 @@ const CANDIDATES = {
   fvg_hourly_1m_entry: {
     fn: tradesFromFvgHourly1mEntry, selectBy: 'winRate', data: '1m',
     grid: grid({ minGapSize: [40, 50], entryDepth: [0.3, 0.5], stopPoints: [25, 30], targetRMultiple: [1.5, 2, 3], maxWaitMinutes: [600], maxHoldMinutes: [360], allowedDaysOfWeek: [[2, 3, 4]] }),
+  },
+  // ── Round 8: the 90%-win-rate frontier, unlocked by the dollar-risk
+  // clarification. The Asia fade hit 87.1% WR on its holdout and lost by
+  // ~2-3 percentage points of win rate / ~0.03R — with its stop capped at
+  // 30pts. Wider stops (sized down in contracts, same dollars at risk)
+  // should cut the noise stop-outs that produced those few extra losses.
+  // Breakeven math these grids probe directly: at RR = target/stop of
+  // 0.125-0.4, breakeven WR is ~71-89% before costs — the exact frontier.
+  asia_fade_widestop: {
+    fn: tradesFromAsiaFade1m, selectBy: 'winRate', data: '1m',
+    grid: grid({ rangeMinutes: [60], stopPoints: [50, 80], targetPoints: [10, 15, 20], minRangeSize: [20, 40], enforceStopCap: [false], allowedDaysOfWeek: [[0, 1, 2, 3, 4, 5, 6], [0, 2, 3, 4, 5, 6]] }),
+  },
+  london_fade_widestop: {
+    fn: tradesFromWindowFade1m, selectBy: 'winRate', data: '1m',
+    grid: grid({ windowStartH: [1], windowEndH: [7], rangeMinutes: [60], stopPoints: [50, 80], targetPoints: [10, 15, 20], minRangeSize: [20, 40], allowedDaysOfWeek: [[1, 2, 3, 4, 5], [2, 3, 4]] }),
+  },
+  lunch_fade_widestop: {
+    fn: tradesFromWindowFade1m, selectBy: 'winRate', data: '1m',
+    grid: grid({ windowStartH: [11], windowEndH: [15], rangeMinutes: [30, 60], stopPoints: [50, 80], targetPoints: [10, 15], minRangeSize: [15, 30], allowedDaysOfWeek: [[1, 2, 3, 4, 5]] }),
   },
 };
 
